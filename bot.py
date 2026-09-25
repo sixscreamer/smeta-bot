@@ -334,10 +334,14 @@ async def send_project_msg(target, pid, edit=False):
     if text is None:
         msg = "Проект не найден."
         return await (target.edit_message_text(msg) if edit else target.reply_text(msg))
-    if edit:
-        return await target.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    # Если пришёл CallbackQuery.message — умеет edit_message_text
+    if edit and hasattr(target, "edit_message_text"):
+        try:
+            return await target.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            pass
+    # Иначе — просто отправляем новое сообщение
     return await target.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-
 
 async def projects_list_view():
     async with pool.acquire() as c:
