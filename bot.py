@@ -740,9 +740,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=kb_back(),
         )
-
-    # открыть проект
-async def send_project_msg(target, pid, edit=False):
+   async def send_project_msg(target, pid, edit=False):
     text, kb = await project_view(pid)
     if text is None:
         msg = "Проект не найден."
@@ -750,8 +748,6 @@ async def send_project_msg(target, pid, edit=False):
             return await target.edit_message_text(msg)
         return await target.reply_text(msg)
 
-    # target может быть Message (у него нет edit_message_text)
-    # или CallbackQuery (тогда у него есть edit_message_text)
     if edit and hasattr(target, "edit_message_text"):
         try:
             return await target.edit_message_text(
@@ -759,8 +755,13 @@ async def send_project_msg(target, pid, edit=False):
             )
         except Exception as e:
             log.warning("edit_message_text failed: %s", e)
-    # фолбэк — просто отправим новое сообщение
     return await target.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    # открыть проект
+    if data.startswith("project:view:"):
+        pid = int(data.split(":")[2])
+        ctx.user_data["current_project"] = pid
+        return await send_project_msg(q, pid, edit=True)
+
 
     # настройки
     if data.startswith("project:settings:"):
