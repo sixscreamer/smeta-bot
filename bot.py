@@ -1,6 +1,3 @@
-from dotenv import load_dotenv
-load_dotenv()
-
 import os
 import io
 import re
@@ -38,7 +35,7 @@ log = logging.getLogger("smeta")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-pool = None
+pool: asyncpg.Pool | None = None
 
 CATEGORIES = [
     "🎬 Аренда",
@@ -51,10 +48,13 @@ CATEGORIES = [
     "📦 Другое",
 ]
 
+# Роли заранее — пригодятся, когда будем ограничивать права
 ROLE_OWNER = "owner"
 ROLE_MEMBER = "member"
 ROLE_VIEWER = "viewer"
 
+
+# ---------- DB ----------
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -124,6 +124,8 @@ async def upsert_user(u):
             u.id, u.username, u.first_name, u.last_name,
         )
 
+
+# ---------- helpers ----------
 
 def money(v) -> str:
     if v is None:
@@ -195,11 +197,11 @@ MEASURE_WORDS = {
 }
 
 
-def _num(s):
+def _num(s: str) -> Decimal:
     return Decimal(s.replace(",", "."))
 
 
-def _clean_name(s):
+def _clean_name(s: str) -> str:
     parts = [p for p in s.strip().split() if p]
     while parts and parts[0].lower() in MEASURE_WORDS:
         parts.pop(0)
@@ -209,12 +211,14 @@ def _clean_name(s):
     return name
 
 
-def parse_quick(text):
+def parse_quick(text: str):
+    """Возвращает (name, qty, price) или None. Если неоднозначно — None."""
     if not text:
         return None
     t = text.strip()
     low = t.lower()
 
+    # 3 банки краски по 850
     m = re.match(
         r"^(\d+(?:[.,]\d+)?)\s+(.+?)\s+по\s+(\d+(?:[.,]\d+)?)\s*"
         r"(?:₽|руб\.?|р\.?)?$",
@@ -223,6 +227,7 @@ def parse_quick(text):
     if m:
         return _clean_name(m.group(2)), _num(m.group(1)), _num(m.group(3))
 
+    # 3 банки краски 850
     m = re.match(
         r"^(\d+(?:[.,]\d+)?)\s+(.+?)\s+(\d+(?:[.,]\d+)?)\s*"
         r"(?:₽|руб\.?|р\.?)?$",
@@ -231,6 +236,7 @@ def parse_quick(text):
     if m:
         return _clean_name(m.group(2)), _num(m.group(1)), _num(m.group(3))
 
+    # краска 3 x 850
     m = re.match(
         r"^(.+?)\s+(\d+(?:[.,]\d+)?)\s*[x×*]\s*(\d+(?:[.,]\d+)?)\s*"
         r"(?:₽|руб\.?|р\.?)?$",
@@ -239,6 +245,7 @@ def parse_quick(text):
     if m:
         return _clean_name(m.group(1)), _num(m.group(2)), _num(m.group(3))
 
+    # такси 1200
     m = re.match(
         r"^([^\d].*?)\s+(\d+(?:[.,]\d+)?)\s*(?:₽|руб\.?|р\.?)?$",
         low,
@@ -248,6 +255,8 @@ def parse_quick(text):
 
     return None
 
+
+# ---------- keyboards ----------
 
 def kb_main():
     return InlineKeyboardMarkup([
@@ -295,6 +304,8 @@ def kb_confirm(pid):
         [InlineKeyboardButton("❌ Отмена",     callback_data=f"exp:cancel:{pid}")],
     ])
 
+
+# ---------- views ----------
 
 async def project_view(pid):
     async with pool.acquire() as c:
@@ -385,7 +396,9 @@ def _exp_summary(exp):
     return "\n".join(lines)
 
 
-def _safe_name(name):
+# ---------- Excel / PDF ----------
+
+def _safe_name(name: str) -> str:
     s = re.sub(r"[^\w\-]+", "_", name or "").strip("_")
     return (s[:40] or "smeta")
 
@@ -510,6 +523,8 @@ async def make_pdf(update, pid):
     await q.message.reply_document(out, filename=f"smeta_{_safe_name(p['name'])}.pdf")
 
 
+# ---------- commands ----------
+
 async def cmd_start(update, ctx):
     u = update.effective_user
     await upsert_user(u)
@@ -540,6 +555,8 @@ async def cmd_cancel(update, ctx):
     await update.message.reply_text("Отменено.", reply_markup=kb_main())
 
 
+# ---------- text handler ----------
+
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await upsert_user(u)
@@ -547,6 +564,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     if not state:
+        # Если пользователь уже внутри проекта — пробуем быстрый ввод
         pid = ctx.user_data.get("current_project")
         if pid:
             parsed = parse_quick(text)
@@ -578,6 +596,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data.pop(k, None)
         return await update.message.reply_text("Отменено.", reply_markup=kb_main())
 
+    # --- новый проект: название ---
     if state == "new_project:name":
         if not text:
             return
@@ -590,6 +609,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
+    # --- новый проект: бюджет ---
     if state == "new_project:budget":
         val = parse_money(text)
         if val is None:
@@ -613,6 +633,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                         parse_mode=ParseMode.HTML)
         return await send_project_msg(update.message, pid)
 
+    # --- расход: название / быстрый ввод ---
     if state == "exp:name":
         exp = ctx.user_data.get("exp") or {}
         parsed = parse_quick(text)
@@ -639,6 +660,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
+    # --- расход: количество ---
     if state == "exp:qty":
         val = parse_number(text)
         if val is None:
@@ -648,6 +670,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["state"] = "exp:price"
         return await update.message.reply_text("Цена за единицу? (например 850)")
 
+    # --- расход: цена ---
     if state == "exp:price":
         val = parse_money(text)
         if val is None:
@@ -662,6 +685,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_categories(exp["project_id"]),
         )
 
+    # --- расход: комментарий ---
     if state == "exp:comment":
         exp = ctx.user_data["exp"]
         exp["comment"] = text
@@ -672,6 +696,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_confirm(exp["project_id"]),
         )
 
+    # --- редактирование бюджета ---
     if state == "project:budget":
         val = parse_money(text)
         if val is None:
@@ -687,6 +712,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Не понял. /cancel — отмена.", reply_markup=kb_main())
 
 
+# ---------- callback router ----------
+
 async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -694,12 +721,14 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await upsert_user(u)
 
+    # список / меню
     if data == "menu":
         return await q.edit_message_text("Меню:", reply_markup=kb_main())
     if data == "projects":
         text, kb = await projects_list_view()
         return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
+    # новый проект
     if data == "project:new":
         ctx.user_data["state"] = "new_project:name"
         return await q.edit_message_text(
@@ -708,11 +737,13 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_back(),
         )
 
+    # открыть проект
     if data.startswith("project:view:"):
         pid = int(data.split(":")[2])
         ctx.user_data["current_project"] = pid
         return await send_project_msg(q.message, pid, edit=True)
 
+    # настройки
     if data.startswith("project:settings:"):
         pid = int(data.split(":")[2])
         async with pool.acquire() as c:
@@ -751,6 +782,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Отправьте новый бюджет числом (например 150000).\n\n/cancel — отмена."
         )
 
+    # удаление
     if data.startswith("project:delete:"):
         pid = int(data.split(":")[2])
         kb = InlineKeyboardMarkup([
@@ -769,6 +801,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, kb = await projects_list_view()
         return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
+    # расход: старт
     if data.startswith("exp:add:"):
         pid = int(data.split(":")[2])
         ctx.user_data["state"] = "exp:name"
@@ -788,6 +821,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]),
         )
 
+    # расход: список
     if data.startswith("exp:list:"):
         pid = int(data.split(":")[2])
         async with pool.acquire() as c:
@@ -830,6 +864,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ])
         return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
+    # расход: категория
     if data.startswith("cat:"):
         _, pid_s, idx_s = data.split(":")
         pid = int(pid_s)
@@ -844,6 +879,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_comment(pid),
         )
 
+    # расход: пропустить комментарий
     if data.startswith("exp:skip_comment:"):
         pid = int(data.split(":")[2])
         exp = ctx.user_data.get("exp") or {"project_id": pid}
@@ -857,6 +893,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_confirm(pid),
         )
 
+    # расход: сохранить
     if data.startswith("exp:save:"):
         pid = int(data.split(":")[2])
         exp = ctx.user_data.get("exp") or {}
@@ -891,6 +928,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb,
         )
 
+    # расход: отмена
     if data.startswith("exp:cancel:"):
         pid = int(data.split(":")[2])
         ctx.user_data.pop("state", None)
@@ -902,6 +940,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb,
         )
 
+    # экспорт
     if data.startswith("excel:"):
         return await make_excel(update, int(data.split(":")[2]))
     if data.startswith("pdf:"):
@@ -909,6 +948,8 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     log.warning("Unhandled callback: %s", data)
 
+
+# ---------- entrypoint ----------
 
 async def post_init(app):
     await init_db()
