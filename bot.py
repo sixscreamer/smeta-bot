@@ -941,10 +941,17 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     # экспорт
-    if data.startswith("excel:"):
-        return await make_excel(update, int(data.split(":")[2]))
-    if data.startswith("pdf:"):
-        return await make_pdf(update, int(data.split(":")[2]))
+   if data.startswith("excel:"):
+    parts = data.split(":")
+    if len(parts) < 3 or not parts[2].isdigit():
+        return await q.edit_message_text("Ошибка: не понял, какой проект открыть. Нажми кнопку ещё раз.")
+    return await make_excel(update, int(parts[2]))
+
+if data.startswith("pdf:"):
+    parts = data.split(":")
+    if len(parts) < 3 or not parts[2].isdigit():
+        return await q.edit_message_text("Ошибка: не понял, какой проект открыть. Нажми кнопку ещё раз.")
+    return await make_pdf(update, int(parts[2]))
 
     log.warning("Unhandled callback: %s", data)
 
