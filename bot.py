@@ -174,6 +174,10 @@ async def migrate_db():
             WHERE e.author_id IS NOT NULL
             ON CONFLICT (project_id, user_id) DO NOTHING
             """
+                    # 4. Переименование старых категорий
+        await c.execute(
+            "UPDATE expenses SET category='💄 Макияж' WHERE category='💄 Грим'"
+        )
         )
     log.info("Migration done")
 
