@@ -343,7 +343,6 @@ async def send_project_msg(target, pid, edit=False):
             log.warning("edit_message_text failed: %s", e)
     return await target.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-
 async def projects_list_view():
     async with pool.acquire() as c:
         rows = await c.fetch(
@@ -746,7 +745,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Не понял. /cancel — отмена.", reply_markup=kb_main())
 
-
 async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -754,13 +752,16 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await upsert_user(u)
 
+    # меню
     if data == "menu":
         return await q.edit_message_text("Меню:", reply_markup=kb_main())
 
+    # список проектов
     if data == "projects":
         text, kb = await projects_list_view()
         return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
+    # новый проект
     if data == "project:new":
         ctx.user_data["state"] = "new_project:name"
         return await q.edit_message_text(
@@ -769,6 +770,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_back(),
         )
 
+    # ОТКРЫТЬ ПРОЕКТ
     if data.startswith("project:view:"):
         try:
             pid = int(data.split(":")[2])
@@ -777,6 +779,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["current_project"] = pid
         return await send_project_msg(q, pid, edit=True)
 
+    # настройки
     if data.startswith("project:settings:"):
         pid = int(data.split(":")[2])
         async with pool.acquire() as c:
@@ -821,4 +824,194 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ])
         return await q.edit_message_text(
             "Удалить проект и все его расходы? Действие необратимо.",
-            reply
+            reply_markup=kb,
+        )
+
+    if data.startswith("project:delete_yes:"):
+        pid = int(data.split(":")[2])
+        async with pool.acquire() as c:
+            await c.execute("DELETE FROM projects WHERE id=$1", pid)
+        ctx.user_data.pop("current_project", None)
+        text, kb = await projects_list_view()
+        return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    # добавить расход
+    if data.startswith("exp:add:"):
+        pid = int(data.split(":")[2])
+        ctx.user_data["state"] = "exp:name"
+        ctx.user_data["exp"] = {"project_id": pid}
+        ctx.user_data["current_project"] = pid
+        return await q.edit_message_text(
+            "➕ <b>Новый расход</b>\n\n"
+            "Напишите одной строкой, например:\n"
+            "• <code>такси 1200</code>\n"
+            "• <code>3 банки краски по 850</code>\n"
+            "• <code>свет 2 x 500</code>\n\n"
+            "Или отправьте только название — введу по шагам.\n\n"
+            "/cancel — отмена",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Отмена", callback_data=f"exp:cancel:{pid}")],
+            ]),
+        )
+
+    # список расходов
+    if data.startswith("exp:list:"):
+        pid = int(data.split(":")[2])
+        async with pool.acquire() as c:
+            p = await c.fetchrow("SELECT * FROM projects WHERE id=$1", pid)
+            rows = await c.fetch(
+                "SELECT * FROM expenses WHERE project_id=$1 ORDER BY id DESC LIMIT 100",
+                pid,
+            )
+        if not p:
+            return await q.edit_message_text("Проект не найден.")
+        if not rows:
+            body = "Расходов пока нет."
+        else:
+            rows = _sort_rows_by_category(rows)
+            blocks = []
+            for r in rows:
+                qv = Decimal(str(r["qty"]))
+                pv = Decimal(str(r["price"]))
+                s = qv * pv
+                author = (
+                    ("@" + r["author_username"]) if r["author_username"]
+                    else (f"id{r['author_id']}" if r["author_id"] else "—")
+                )
+                dt = r["created_at"].strftime("%d.%m.%Y %H:%M") if r["created_at"] else ""
+                block = [
+                    f"{esc(r['category'])}",
+                    f"<b>{esc(r['name'])}</b>",
+                    f"{fmt_qty(qv)} × {money(pv)} = {money(s)}",
+                ]
+                if r["comment"]:
+                    block.append(f"💬 {esc(r['comment'])}")
+                block.append(f"👤 {esc(author)} · {dt}")
+                blocks.append("\n".join(block))
+            body = "\n\n".join(blocks)
+        text = f"📋 <b>Расходы проекта «{esc(p['name'])}»</b>\n\n{body}"
+        if len(text) > 4000:
+            text = text[:3900] + "\n\n… (показаны не все)"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Добавить расход", callback_data=f"exp:add:{pid}")],
+            [InlineKeyboardButton("◀️ Назад к проекту", callback_data=f"project:view:{pid}")],
+        ])
+        return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    # выбор категории
+    if data.startswith("cat:"):
+        _, pid_s, idx_s = data.split(":")
+        pid = int(pid_s)
+        cat = CATEGORIES[int(idx_s)]
+        exp = ctx.user_data.get("exp") or {"project_id": pid}
+        exp["category"] = cat
+        ctx.user_data["exp"] = exp
+        ctx.user_data["state"] = "exp:comment"
+        return await q.edit_message_text(
+            f"Категория: {esc(cat)}\n\nКомментарий? Отправьте текст или нажмите «Пропустить».",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_comment(pid),
+        )
+
+    if data.startswith("exp:skip_comment:"):
+        pid = int(data.split(":")[2])
+        exp = ctx.user_data.get("exp") or {"project_id": pid}
+        exp.setdefault("category", "📦 Другое")
+        exp["comment"] = None
+        ctx.user_data["exp"] = exp
+        ctx.user_data["state"] = "exp:confirm"
+        return await q.edit_message_text(
+            _exp_summary(exp),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_confirm(pid),
+        )
+
+    if data.startswith("exp:save:"):
+        pid = int(data.split(":")[2])
+        exp = ctx.user_data.get("exp") or {}
+        name = exp.get("name")
+        if not name:
+            return await q.edit_message_text("Что-то пошло не так. Начните заново.")
+        qty = Decimal(str(exp.get("qty", "1")))
+        price = Decimal(str(exp.get("price", "0")))
+        cat = exp.get("category", "📦 Другое")
+        comment = exp.get("comment")
+        async with pool.acquire() as c:
+            await c.execute(
+                """
+                INSERT INTO expenses(project_id, category, name, qty, price,
+                                     comment, author_id, author_username)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+                """,
+                pid, cat, name, qty, price, comment, u.id, u.username,
+            )
+            await c.execute(
+                "INSERT INTO project_members(project_id, user_id, role) VALUES($1,$2,$3) "
+                "ON CONFLICT DO NOTHING",
+                pid, u.id, ROLE_MEMBER,
+            )
+        ctx.user_data.pop("state", None)
+        ctx.user_data.pop("exp", None)
+        ctx.user_data["current_project"] = pid
+        text, kb = await project_view(pid)
+        return await q.edit_message_text(
+            "✅ Расход добавлен.\n\n" + text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+
+    if data.startswith("exp:cancel:"):
+        pid = int(data.split(":")[2])
+        ctx.user_data.pop("state", None)
+        ctx.user_data.pop("exp", None)
+        text, kb = await project_view(pid)
+        return await q.edit_message_text(
+            "Отменено.\n\n" + text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+
+    # экспорт Excel
+    if data.startswith("excel:"):
+        try:
+            pid = int(data.split(":")[1])
+        except (IndexError, ValueError):
+            return await q.edit_message_text("Ошибка: не понял, какой проект.")
+        return await make_excel(update, pid)
+
+    # экспорт PDF
+    if data.startswith("pdf:"):
+        try:
+            pid = int(data.split(":")[1])
+        except (IndexError, ValueError):
+            return await q.edit_message_text("Ошибка: не понял, какой проект.")
+        return await make_pdf(update, pid)
+
+    log.warning("Unhandled callback: %s", data)
+
+
+async def post_init(app):
+    await init_db()
+    me = await app.bot.get_me()
+    log.info("Bot @%s started", me.username)
+
+
+def main():
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("projects", cmd_projects))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
