@@ -42,7 +42,6 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 
 pool = None
 
-# ВАЖНО: порядок в этом списке = порядок сортировки категорий
 CATEGORIES = [
     "🎬 Аренда",
     "👕 Одежда",
@@ -54,9 +53,7 @@ CATEGORIES = [
     "📦 Другое",
 ]
 
-# Словарь: категория → её порядковый номер. Используется для ORDER BY.
 CATEGORY_ORDER = {name: i for i, name in enumerate(CATEGORIES)}
-# Плюс fallback для расходов с категорией, которой нет в списке
 FALLBACK_ORDER = len(CATEGORIES) + 1
 
 ROLE_OWNER = "owner"
@@ -327,8 +324,6 @@ async def project_view(pid):
 
 
 async def send_project_msg(target, pid, edit=False):
-    """target — либо CallbackQuery (у него есть edit_message_text),
-    либо Message (только reply_text)."""
     text, kb = await project_view(pid)
     if text is None:
         msg = "Проект не найден."
@@ -412,7 +407,6 @@ def _safe_name(name):
 
 
 def _sort_rows_by_category(rows):
-    """Сортирует список расходов по порядку категорий из CATEGORIES."""
     return sorted(
         rows,
         key=lambda r: (
@@ -422,10 +416,7 @@ def _sort_rows_by_category(rows):
     )
 
 
-# ---------- Шрифт с кириллицей для PDF ----------
-
 def _register_cyrillic_fonts():
-    """Подключает DejaVu Sans для русского текста в PDF. Возвращает (FONT, FONT_BOLD)."""
     regular_candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
@@ -449,8 +440,6 @@ def _register_cyrillic_fonts():
         font_bold = "Helvetica-Bold"
     return font, font_bold
 
-
-# ---------- Excel ----------
 
 async def make_excel(update, pid):
     q = update.callback_query
@@ -520,8 +509,6 @@ async def make_excel(update, pid):
     await q.message.reply_document(buf, filename=f"smeta_{_safe_name(p['name'])}.xlsx")
 
 
-# ---------- PDF ----------
-
 async def make_pdf(update, pid):
     q = update.callback_query
     async with pool.acquire() as c:
@@ -582,8 +569,6 @@ async def make_pdf(update, pid):
     out.seek(0)
     await q.message.reply_document(out, filename=f"smeta_{_safe_name(p['name'])}.pdf")
 
-
-# ---------- Команды ----------
 
 async def cmd_start(update, ctx):
     u = update.effective_user
@@ -769,16 +754,13 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await upsert_user(u)
 
-    # меню
     if data == "menu":
         return await q.edit_message_text("Меню:", reply_markup=kb_main())
 
-    # список проектов
     if data == "projects":
         text, kb = await projects_list_view()
         return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    # новый проект
     if data == "project:new":
         ctx.user_data["state"] = "new_project:name"
         return await q.edit_message_text(
@@ -787,7 +769,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_back(),
         )
 
-    # ОТКРЫТЬ ПРОЕКТ
     if data.startswith("project:view:"):
         try:
             pid = int(data.split(":")[2])
@@ -796,7 +777,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["current_project"] = pid
         return await send_project_msg(q, pid, edit=True)
 
-    # настройки
     if data.startswith("project:settings:"):
         pid = int(data.split(":")[2])
         async with pool.acquire() as c:
@@ -823,4 +803,22 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✏️ Изменить бюджет", callback_data=f"project:budget:{pid}")],
             [InlineKeyboardButton("◀️ Назад",           callback_data=f"project:view:{pid}")],
         ])
-        return await q.edit_message_text(text, parse_mode=ParseMode.H
+        return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    if data.startswith("project:budget:"):
+        pid = int(data.split(":")[2])
+        ctx.user_data["state"] = "project:budget"
+        ctx.user_data["budget_pid"] = pid
+        return await q.edit_message_text(
+            "Отправьте новый бюджет числом (например 150000).\n\n/cancel — отмена."
+        )
+
+    if data.startswith("project:delete:"):
+        pid = int(data.split(":")[2])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Да, удалить", callback_data=f"project:delete_yes:{pid}")],
+            [InlineKeyboardButton("◀️ Отмена",      callback_data=f"project:view:{pid}")],
+        ])
+        return await q.edit_message_text(
+            "Удалить проект и все его расходы? Действие необратимо.",
+            reply
