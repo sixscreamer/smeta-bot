@@ -181,6 +181,23 @@ async def init_db():
     await migrate_db()
     log.info("DB schema ready")
 
+async def upsert_user(u):
+    if u is None:
+        return
+    async with pool.acquire() as c:
+        await c.execute(
+            """
+            INSERT INTO users(user_id, username, first_name, last_name, updated_at)
+            VALUES($1,$2,$3,$4,NOW())
+            ON CONFLICT (user_id) DO UPDATE
+            SET username   = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                last_name  = EXCLUDED.last_name,
+                updated_at = NOW()
+            """,
+            u.id, u.username, u.first_name, u.last_name,
+        )
+
 
 # ---------- Права и роли ----------
 
