@@ -675,7 +675,62 @@ async def projects_list_view(user_id, mode):
 
 
 # ---------- Резюме расхода ----------
+async def show_delete_choices(target, ctx, pid, user_id, query=None):
+    """Показывает расходы кнопками для удаления. Если query — фильтрует по названию."""
+    async with pool.acquire() as c:
+        p = await c.fetchrow("SELECT name FROM projects WHERE id=$1", pid)
+        if not p:
+            return await target.edit_message_text("Проект не найден.")
+        if query:
+            rows = await c.fetch(
+                """
+                SELECT id, name, qty, price, category, created_at
+                FROM expenses
+                WHERE project_id=$1 AND LOWER(name) LIKE $2
+                ORDER BY id DESC
+                LIMIT 25
+                """,
+                pid, f"%{query.lower()}%",
+            )
+        else:
+            rows = await c.fetch(
+                """
+                SELECT id, name, qty, price, category, created_at
+                FROM expenses
+                WHERE project_id=$1
+                ORDER BY id DESC
+                LIMIT 25
+                """,
+                pid,
+            )
+    if not rows:
+        return await target.edit_message_text(
+            "Ничего не найдено. Попробуйте другое слово." if query else "Расходов нет.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ К расходам", callback_data=f"exp:list:{pid}")],
+            ]),
+        )
 
+    kb_rows = []
+    for r in rows:
+        qv = Decimal(str(r["qty"]))
+        pv = Decimal(str(r["price"]))
+        s = qv * pv
+        label = f"{r['category']} {r['name']} · {money(s)}"[:60]
+        kb_rows.append([
+            InlineKeyboardButton(label, callback_data=f"exp:delete_pick:{r['id']}")
+        ])
+    kb_rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"exp:list:{pid}")])
+
+    if query:
+        header = f"Найдено по запросу «{esc(query)}»: {len(rows)}"
+    else:
+        header = f"Всего расходов: {len(rows)}. Выберите, что удалить:"
+
+    return await target.edit_message_text(
+        header,
+        reply_markup=InlineKeyboardMarkup(kb_rows),
+    )
 def _exp_summary(exp):
     qv = Decimal(str(exp.get("qty", "1")))
     pv = Decimal(str(exp.get("price", "0")))
@@ -985,7 +1040,51 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=kb_project_type(),
         )
+    # --- поиск расхода для удаления ---
+    if state == "delete:search":
+        pid = ctx.user_data.get("delete_pid")
+        if not pid:
+            ctx.user_data.pop("state", None)
+            return await update.message.reply_text("Что-то пошло не так.", reply_markup=kb_main())
+        word = text.strip()
+        if not word:
+            return await update.message.reply_text("Введите слово, например: такси")
+        ctx.user_data.pop("state", None)
+        ctx.user_data.pop("delete_pid", None)
 
+        async with pool.acquire() as c:
+            rows = await c.fetch(
+                """
+                SELECT id, name, qty, price, category
+                FROM expenses
+                WHERE project_id=$1 AND LOWER(name) LIKE $2
+                ORDER BY id DESC
+                LIMIT 25
+                """,
+                pid, f"%{word.lower()}%",
+            )
+        if not rows:
+            return await update.message.reply_text(
+                f"По слову «{esc(word)}» ничего не найдено.\n"
+                "Попробуйте другой вариант или /cancel.",
+                parse_mode=ParseMode.HTML,
+            )
+
+        kb_rows = []
+        for r in rows:
+            qv = Decimal(str(r["qty"]))
+            pv = Decimal(str(r["price"]))
+            s = qv * pv
+            label = f"{r['category']} {r['name']} · {money(s)}"[:60]
+            kb_rows.append([
+                InlineKeyboardButton(label, callback_data=f"exp:delete_pick:{r['id']}")
+            ])
+        kb_rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"exp:list:{pid}")])
+
+        return await update.message.reply_text(
+            f"Найдено: {len(rows)}. Выберите, что удалить:",
+            reply_markup=InlineKeyboardMarkup(kb_rows),
+        )
     # --- приглашение по username ---
     if state == "invite:username":
         pid = ctx.user_data.get("invite_pid")
@@ -1426,12 +1525,82 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = f"📋 <b>Расходы проекта «{esc(p['name'])}»</b>\n\n{body}"
         if len(text) > 4000:
             text = text[:3900] + "\n\n… (показаны не все)"
-        kb = InlineKeyboardMarkup([
+              kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Добавить расход", callback_data=f"exp:add:{pid}")],
+            [InlineKeyboardButton("🗑 Удалить расход",  callback_data=f"exp:delete:{pid}")],
             [InlineKeyboardButton("◀️ Назад к проекту", callback_data=f"project:view:{pid}")],
         ])
         return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    # --- удаление расхода ---
+    if data.startswith("exp:delete:"):
+        pid = int(data.split(":")[2])
+        if not await user_can_view_project(pid, u.id):
+            return await q.edit_message_text("У вас нет доступа к этому проекту.")
+        async with pool.acquire() as c:
+            cnt = await c.fetchval(
+                "SELECT COUNT(*) FROM expenses WHERE project_id=$1", pid
+            )
+        if cnt == 0:
+            return await q.edit_message_text(
+                "Расходов нет.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ К расходам", callback_data=f"exp:list:{pid}")],
+                ]),
+            )
+        if cnt > 25:
+            ctx.user_data["state"] = "delete:search"
+            ctx.user_data["delete_pid"] = pid
+            return await q.edit_message_text(
+                f"В проекте {cnt} расходов. Слишком много для списка.\n\n"
+                "Введите часть названия расхода, который хотите удалить.\n"
+                "Например: <code>такси</code>\n\n"
+                "/cancel — отмена",
+                parse_mode=ParseMode.HTML,
+            )
+        return await show_delete_choices(q, ctx, pid, u.id)
 
+    if data.startswith("exp:delete_pick:"):
+        eid = int(data.split(":")[2])
+        async with pool.acquire() as c:
+            e = await c.fetchrow(
+                "SELECT id, project_id, name, qty, price, category FROM expenses WHERE id=$1",
+                eid,
+            )
+        if not e:
+            return await q.edit_message_text("Расход уже удалён.")
+        if not await user_can_view_project(e["project_id"], u.id):
+            return await q.edit_message_text("У вас нет доступа к этому проекту.")
+        qv = Decimal(str(e["qty"]))
+        pv = Decimal(str(e["price"]))
+        s = qv * pv
+        text = (
+            "Удалить этот расход?\n\n"
+            f"{esc(e['category'])}\n"
+            f"<b>{esc(e['name'])}</b>\n"
+            f"{fmt_qty(qv)} × {money(pv)} = <b>{money(s)}</b>"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Да, удалить", callback_data=f"exp:delete_yes:{eid}")],
+            [InlineKeyboardButton("❌ Отмена",      callback_data=f"exp:list:{e['project_id']}")],
+        ])
+        return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    if data.startswith("exp:delete_yes:"):
+        eid = int(data.split(":")[2])
+        async with pool.acquire() as c:
+            e = await c.fetchrow(
+                "SELECT project_id FROM expenses WHERE id=$1", eid
+            )
+        if not e:
+            return await q.edit_message_text("Расход уже удалён.")
+        pid = e["project_id"]
+        if not await user_can_view_project(pid, u.id):
+            return await q.edit_message_text("У вас нет доступа к этому проекту.")
+        async with pool.acquire() as c:
+            await c.execute("DELETE FROM expenses WHERE id=$1", eid)
+        await q.edit_message_text("✅ Расход удалён.")
+        text, kb = await project_view(pid, user_id=u.id)
+        return await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
     # --- выбор категории ---
     if data.startswith("cat:"):
         _, pid_s, idx_s = data.split(":")
