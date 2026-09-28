@@ -124,6 +124,26 @@ async def migrate_db():
       выдаётся членство в project_members.
     Безопасно запускать много раз — операция идемпотентна."""
     async with pool.acquire() as c:
+                # 0. Добавляем недостающие колонки/таблицы (если их нет)
+        await c.execute(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS is_personal BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        await c.execute(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+        )
+        await c.execute(
+            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS comment TEXT"
+        )
+        await c.execute(
+            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS author_id BIGINT"
+        )
+        await c.execute(
+            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS author_username TEXT"
+        )
+        await c.execute(
+            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+        )
+
         # 1. Все старые проекты — командные
         await c.execute(
             "UPDATE projects SET is_personal=FALSE WHERE is_personal IS NULL"
