@@ -43,7 +43,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 
 pool = None
-bot_username = None  # заполним в post_init
+bot_username = None
 
 CATEGORIES = [
     "🎬 Аренда",
@@ -120,41 +120,16 @@ CREATE INDEX IF NOT EXISTS idx_members_user     ON project_members(user_id);
 CREATE INDEX IF NOT EXISTS idx_members_project  ON project_members(project_id);
 """
 
-# ---------- Миграция и init ----------
 
 async def migrate_db():
-    """Аккуратно переносит существующие проекты в новую логику:
-    - все старые проекты помечаются как командные (is_personal=FALSE);
-    - всем, кто создал проект или писал в него расходы,
-      выдаётся членство в project_members.
-    Безопасно запускать много раз — операция идемпотентна."""
     async with pool.acquire() as c:
-                # 0. Добавляем недостающие колонки/таблицы (если их нет)
-        await c.execute(
-            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS is_personal BOOLEAN NOT NULL DEFAULT FALSE"
-        )
-        await c.execute(
-            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
-        )
-        await c.execute(
-            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS comment TEXT"
-        )
-        await c.execute(
-            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS author_id BIGINT"
-        )
-        await c.execute(
-            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS author_username TEXT"
-        )
-        await c.execute(
-            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
-        )
-
-        # 1. Все старые проекты — командные
-        await c.execute(
-            "UPDATE projects SET is_personal=FALSE WHERE is_personal IS NULL"
-        )
-
-        # 2. Гарантируем, что у каждого проекта есть creator в members как owner
+        await c.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS is_personal BOOLEAN NOT NULL DEFAULT FALSE")
+        await c.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+        await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS comment TEXT")
+        await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS author_id BIGINT")
+        await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS author_username TEXT")
+        await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+        await c.execute("UPDATE projects SET is_personal=FALSE WHERE is_personal IS NULL")
         await c.execute(
             """
             INSERT INTO project_members(project_id, user_id, role)
@@ -164,8 +139,6 @@ async def migrate_db():
             ON CONFLICT (project_id, user_id) DO NOTHING
             """
         )
-
-        # 3. Все, кто писал расходы — становятся member, если ещё не owner/member
         await c.execute(
             """
             INSERT INTO project_members(project_id, user_id, role)
@@ -174,11 +147,8 @@ async def migrate_db():
             WHERE e.author_id IS NOT NULL
             ON CONFLICT (project_id, user_id) DO NOTHING
             """
-        # 4. Переименование старых категорий
-        await c.execute(
-            "UPDATE expenses SET category='💄 Макияж' WHERE category='💄 Грим'"
         )
-        )
+        await c.execute("UPDATE expenses SET category='💄 Макияж' WHERE category='💄 Грим'")
     log.info("Migration done")
 
 
@@ -189,6 +159,7 @@ async def init_db():
         await c.execute(SCHEMA)
     await migrate_db()
     log.info("DB schema ready")
+
 
 async def upsert_user(u):
     if u is None:
@@ -208,10 +179,7 @@ async def upsert_user(u):
         )
 
 
-# ---------- Права и роли ----------
-
 async def get_user_role(project_id, user_id):
-    """Возвращает 'owner' / 'member' / 'viewer' или None."""
     async with pool.acquire() as c:
         row = await c.fetchrow(
             "SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2",
@@ -221,7 +189,6 @@ async def get_user_role(project_id, user_id):
 
 
 async def user_can_view_project(project_id, user_id):
-    """Может ли пользователь открыть проект."""
     async with pool.acquire() as c:
         p = await c.fetchrow(
             "SELECT id, creator_id, is_personal FROM projects WHERE id=$1",
@@ -229,10 +196,8 @@ async def user_can_view_project(project_id, user_id):
         )
         if not p:
             return False
-        # Личный — видит только создатель
         if p["is_personal"]:
             return p["creator_id"] == user_id
-        # Командный — только участники
         role = await c.fetchval(
             "SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2",
             project_id, user_id,
@@ -241,12 +206,9 @@ async def user_can_view_project(project_id, user_id):
 
 
 async def user_can_edit_project(project_id, user_id):
-    """Может ли менять бюджет / тип / удалять проект. Только owner."""
     role = await get_user_role(project_id, user_id)
     return role == ROLE_OWNER
 
-
-# ---------- Приглашения ----------
 
 def _gen_invite_code(n=8):
     alphabet = string.ascii_letters + string.digits
@@ -254,14 +216,10 @@ def _gen_invite_code(n=8):
 
 
 async def get_or_create_invite_code(project_id):
-    """Возвращает постоянный код приглашения для проекта."""
     async with pool.acquire() as c:
-        row = await c.fetchrow(
-            "SELECT code FROM invites WHERE project_id=$1", project_id
-        )
+        row = await c.fetchrow("SELECT code FROM invites WHERE project_id=$1", project_id)
         if row:
             return row["code"]
-        # генерируем, пока не найдём уникальный
         for _ in range(5):
             code = _gen_invite_code()
             try:
@@ -276,7 +234,6 @@ async def get_or_create_invite_code(project_id):
 
 
 def invite_link(code):
-    """Формирует ссылку вида https://t.me/бот?start=join_XXXX."""
     if not bot_username:
         return f"https://t.me/?start=join_{code}"
     return f"https://t.me/{bot_username}?start=join_{code}"
@@ -308,8 +265,6 @@ def _safe_name(name):
     s = re.sub(r"[^\w\-]+", "_", name or "").strip("_")
     return (s[:40] or "smeta")
 
-
-# ---------- Парсинг ввода ----------
 
 def parse_money(text):
     if not text:
@@ -380,7 +335,6 @@ def parse_quick(text):
     t = text.strip()
     low = t.lower()
 
-    # "3 банки краски по 850"
     m = re.match(
         r"^(\d+(?:[.,]\d+)?)\s+(.+?)\s+по\s+(\d+(?:[.,]\d+)?)\s*"
         r"(?:₽|руб\.?|р\.?)?$",
@@ -389,7 +343,6 @@ def parse_quick(text):
     if m:
         return _clean_name(m.group(2)), _num(m.group(1)), _num(m.group(3))
 
-    # "3 банки краски 850"
     m = re.match(
         r"^(\d+(?:[.,]\d+)?)\s+(.+?)\s+(\d+(?:[.,]\d+)?)\s*"
         r"(?:₽|руб\.?|р\.?)?$",
@@ -398,7 +351,6 @@ def parse_quick(text):
     if m:
         return _clean_name(m.group(2)), _num(m.group(1)), _num(m.group(3))
 
-    # "краска 3 x 850"
     m = re.match(
         r"^(.+?)\s+(\d+(?:[.,]\d+)?)\s*[x×*]\s*(\d+(?:[.,]\d+)?)\s*"
         r"(?:₽|руб\.?|р\.?)?$",
@@ -407,7 +359,6 @@ def parse_quick(text):
     if m:
         return _clean_name(m.group(1)), _num(m.group(2)), _num(m.group(3))
 
-    # "такси 1200"
     m = re.match(
         r"^([^\d].*?)\s+(\d+(?:[.,]\d+)?)\s*(?:₽|руб\.?|р\.?)?$",
         low,
@@ -418,8 +369,6 @@ def parse_quick(text):
     return None
 
 
-# ---------- Сортировка ----------
-
 def _sort_rows_by_category(rows):
     return sorted(
         rows,
@@ -429,8 +378,6 @@ def _sort_rows_by_category(rows):
         ),
     )
 
-
-# ---------- Шрифт для PDF ----------
 
 def _register_cyrillic_fonts():
     regular_candidates = [
@@ -456,13 +403,14 @@ def _register_cyrillic_fonts():
         font_bold = "Helvetica-Bold"
     return font, font_bold
 
+
 # ---------- Клавиатуры ----------
 
 def kb_main():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 Личные проекты",   callback_data="projects:personal")],
+        [InlineKeyboardButton("👤 Личные проекты",    callback_data="projects:personal")],
         [InlineKeyboardButton("👥 Командные проекты", callback_data="projects:team")],
-        [InlineKeyboardButton("➕ Новый проект",      callback_data="project:new")],
+        [InlineKeyboardButton("➕ Новый проект",       callback_data="project:new")],
     ])
 
 
@@ -471,7 +419,6 @@ def kb_back(cb="menu"):
 
 
 def kb_project(pid, role=None):
-    """role: 'owner' — полные права; 'member' — без управления проектом."""
     rows = [
         [InlineKeyboardButton("➕ Добавить расход", callback_data=f"exp:add:{pid}")],
         [
@@ -482,11 +429,11 @@ def kb_project(pid, role=None):
     ]
     if role == ROLE_OWNER:
         rows.append([
-            InlineKeyboardButton("👥 Пригласить",       callback_data=f"project:invite:{pid}"),
-            InlineKeyboardButton("⚙️ Настройки",        callback_data=f"project:settings:{pid}"),
+            InlineKeyboardButton("👥 Пригласить", callback_data=f"project:invite:{pid}"),
+            InlineKeyboardButton("⚙️ Настройки",  callback_data=f"project:settings:{pid}"),
         ])
         rows.append([
-            InlineKeyboardButton("🗑 Удалить проект",   callback_data=f"project:delete:{pid}"),
+            InlineKeyboardButton("🗑 Удалить проект", callback_data=f"project:delete:{pid}"),
         ])
     rows.append([InlineKeyboardButton("◀️ К списку", callback_data="menu")])
     return InlineKeyboardMarkup(rows)
@@ -522,14 +469,13 @@ def kb_project_type():
 
 def kb_invite_menu(pid):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📝 По @username",  callback_data=f"project:invite:user:{pid}")],
-        [InlineKeyboardButton("🔗 Ссылка",        callback_data=f"project:invite:link:{pid}")],
+        [InlineKeyboardButton("📝 По @username", callback_data=f"project:invite:user:{pid}")],
+        [InlineKeyboardButton("🔗 Ссылка",       callback_data=f"project:invite:link:{pid}")],
         [InlineKeyboardButton("◀️ Назад к проекту", callback_data=f"project:view:{pid}")],
     ])
 
 
 def kb_change_type_menu(pid, current_is_personal):
-    """Показывает кнопку переключения на противоположный тип."""
     if current_is_personal:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("👥 Сделать командным", callback_data=f"project:type:team:{pid}")],
@@ -537,12 +483,12 @@ def kb_change_type_menu(pid, current_is_personal):
         ])
     else:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("👤 Сделать личным",    callback_data=f"project:type:personal:{pid}")],
-            [InlineKeyboardButton("◀️ Назад",             callback_data=f"project:settings:{pid}")],
+            [InlineKeyboardButton("👤 Сделать личным", callback_data=f"project:type:personal:{pid}")],
+            [InlineKeyboardButton("◀️ Назад",          callback_data=f"project:settings:{pid}")],
         ])
 
 
-# ---------- Отображение проекта ----------
+# ---------- Отображение ----------
 
 async def project_view(pid, user_id=None):
     async with pool.acquire() as c:
@@ -568,7 +514,6 @@ async def project_view(pid, user_id=None):
     role = None
     if user_id is not None:
         role = await get_user_role(pid, user_id)
-        # если личный — роль всегда 'owner' для создателя
         if p["is_personal"] and p["creator_id"] == user_id:
             role = ROLE_OWNER
     return text, kb_project(pid, role)
@@ -595,13 +540,7 @@ async def send_project_msg(target, pid, edit=False, user_id=None):
     return await target.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-# ---------- Список проектов ----------
-
 async def projects_list_view(user_id, mode):
-    """
-    mode = 'personal' → только личные проекты пользователя (is_personal=TRUE, creator=user)
-    mode = 'team'     → только командные, где пользователь участник
-    """
     async with pool.acquire() as c:
         if mode == "personal":
             rows = await c.fetch(
@@ -674,9 +613,23 @@ async def projects_list_view(user_id, mode):
     return "\n".join(lines), InlineKeyboardMarkup(kb_rows)
 
 
-# ---------- Резюме расхода ----------
+def _exp_summary(exp):
+    qv = Decimal(str(exp.get("qty", "1")))
+    pv = Decimal(str(exp.get("price", "0")))
+    s = qv * pv
+    lines = [
+        "<b>Проверьте расход:</b>",
+        f"• Категория: {esc(exp.get('category', '—'))}",
+        f"• Название: {esc(exp.get('name', '—'))}",
+        f"• Количество: {fmt_qty(qv)}",
+        f"• Цена: {money(pv)}",
+        f"• Сумма: {money(s)}",
+    ]
+    if exp.get("comment"):
+        lines.append(f"• Комментарий: {esc(exp['comment'])}")
+    return "\n".join(lines)
+
 async def show_delete_choices(target, ctx, pid, user_id, query=None):
-    """Показывает расходы кнопками для удаления. Если query — фильтрует по названию."""
     async with pool.acquire() as c:
         p = await c.fetchrow("SELECT name FROM projects WHERE id=$1", pid)
         if not p:
@@ -684,7 +637,7 @@ async def show_delete_choices(target, ctx, pid, user_id, query=None):
         if query:
             rows = await c.fetch(
                 """
-                SELECT id, name, qty, price, category, created_at
+                SELECT id, name, qty, price, category
                 FROM expenses
                 WHERE project_id=$1 AND LOWER(name) LIKE $2
                 ORDER BY id DESC
@@ -695,7 +648,7 @@ async def show_delete_choices(target, ctx, pid, user_id, query=None):
         else:
             rows = await c.fetch(
                 """
-                SELECT id, name, qty, price, category, created_at
+                SELECT id, name, qty, price, category
                 FROM expenses
                 WHERE project_id=$1
                 ORDER BY id DESC
@@ -717,53 +670,27 @@ async def show_delete_choices(target, ctx, pid, user_id, query=None):
         pv = Decimal(str(r["price"]))
         s = qv * pv
         label = f"{r['category']} {r['name']} · {money(s)}"[:60]
-        kb_rows.append([
-            InlineKeyboardButton(label, callback_data=f"exp:delete_pick:{r['id']}")
-        ])
+        kb_rows.append([InlineKeyboardButton(label, callback_data=f"exp:delete_pick:{r['id']}")])
     kb_rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"exp:list:{pid}")])
 
-    if query:
-        header = f"Найдено по запросу «{esc(query)}»: {len(rows)}"
-    else:
-        header = f"Всего расходов: {len(rows)}. Выберите, что удалить:"
+    header = f"Найдено по запросу «{esc(query)}»: {len(rows)}" if query else f"Всего расходов: {len(rows)}. Выберите, что удалить:"
 
-    return await target.edit_message_text(
-        header,
-        reply_markup=InlineKeyboardMarkup(kb_rows),
-    )
-def _exp_summary(exp):
-    qv = Decimal(str(exp.get("qty", "1")))
-    pv = Decimal(str(exp.get("price", "0")))
-    s = qv * pv
-    lines = [
-        "<b>Проверьте расход:</b>",
-        f"• Категория: {esc(exp.get('category', '—'))}",
-        f"• Название: {esc(exp.get('name', '—'))}",
-        f"• Количество: {fmt_qty(qv)}",
-        f"• Цена: {money(pv)}",
-        f"• Сумма: {money(s)}",
-    ]
-    if exp.get("comment"):
-        lines.append(f"• Комментарий: {esc(exp['comment'])}")
-    return "\n".join(lines)
+    return await target.edit_message_text(header, reply_markup=InlineKeyboardMarkup(kb_rows))
+
 
 # ---------- Excel ----------
 
 async def make_excel(update, pid):
     q = update.callback_query
     user_id = update.effective_user.id
-
     if not await user_can_view_project(pid, user_id):
         return await q.message.reply_text("У вас нет доступа к этому проекту.")
-
     async with pool.acquire() as c:
         p = await c.fetchrow("SELECT * FROM projects WHERE id=$1", pid)
         rows = await c.fetch("SELECT * FROM expenses WHERE project_id=$1", pid)
     if not p:
         return await q.message.reply_text("Проект не найден.")
-
     rows = _sort_rows_by_category(rows)
-
     total = sum((Decimal(str(r["qty"])) * Decimal(str(r["price"])) for r in rows), Decimal(0))
     budget = Decimal(str(p["budget"]))
     left = budget - total
@@ -771,21 +698,16 @@ async def make_excel(update, pid):
     wb = Workbook()
     ws = wb.active
     ws.title = "Смета"
-
     ws["A1"] = "СМЕТА"
     ws["A1"].font = Font(bold=True, size=16)
     ws.merge_cells("A1:H1")
+    ws["A2"] = "Проект";    ws["B2"] = p["name"]
+    ws["A3"] = "Тип";       ws["B3"] = "Личный" if p["is_personal"] else "Командный"
+    ws["A4"] = "Бюджет";    ws["B4"] = float(budget)
+    ws["A5"] = "Потрачено"; ws["B5"] = float(total)
+    ws["A6"] = "Осталось";  ws["B6"] = float(left)
 
-    ws["A2"] = "Проект";     ws["B2"] = p["name"]
-    ws["A3"] = "Тип";        ws["B3"] = "Личный" if p["is_personal"] else "Командный"
-    ws["A4"] = "Бюджет";     ws["B4"] = float(budget)
-    ws["A5"] = "Потрачено";  ws["B5"] = float(total)
-    ws["A6"] = "Осталось";   ws["B6"] = float(left)
-
-    headers = [
-        "Категория", "Наименование", "Количество", "Цена", "Сумма",
-        "Комментарий", "Кто добавил", "Дата",
-    ]
+    headers = ["Категория", "Наименование", "Количество", "Цена", "Сумма", "Комментарий", "Кто добавил", "Дата"]
     ws.append([])
     ws.append(headers)
     header_row = ws.max_row
@@ -802,18 +724,12 @@ async def make_excel(update, pid):
         pv = Decimal(str(r["price"]))
         s = qv * pv
         dt = r["created_at"].strftime("%d.%m.%Y %H:%M") if r["created_at"] else ""
-        author = ("@" + r["author_username"]) if r["author_username"] else (
-            f"id{r['author_id']}" if r["author_id"] else ""
-        )
-        ws.append([
-            r["category"], r["name"], float(qv), float(pv), float(s),
-            r["comment"] or "", author, dt,
-        ])
+        author = ("@" + r["author_username"]) if r["author_username"] else (f"id{r['author_id']}" if r["author_id"] else "")
+        ws.append([r["category"], r["name"], float(qv), float(pv), float(s), r["comment"] or "", author, dt])
 
     total_row = ws.max_row + 1
     ws.cell(row=total_row, column=4, value="ИТОГО").font = bold
     ws.cell(row=total_row, column=5, value=float(total)).font = bold
-
     for i, w in enumerate([18, 28, 12, 12, 14, 30, 18, 18], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -823,39 +739,27 @@ async def make_excel(update, pid):
     await q.message.reply_document(buf, filename=f"smeta_{_safe_name(p['name'])}.xlsx")
 
 
-# ---------- PDF ----------
-
 async def make_pdf(update, pid):
     q = update.callback_query
     user_id = update.effective_user.id
-
     if not await user_can_view_project(pid, user_id):
         return await q.message.reply_text("У вас нет доступа к этому проекту.")
-
     async with pool.acquire() as c:
         p = await c.fetchrow("SELECT * FROM projects WHERE id=$1", pid)
         rows = await c.fetch("SELECT * FROM expenses WHERE project_id=$1", pid)
     if not p:
         return await q.message.reply_text("Проект не найден.")
-
     rows = _sort_rows_by_category(rows)
-
     total = sum((Decimal(str(r["qty"])) * Decimal(str(r["price"])) for r in rows), Decimal(0))
     budget = Decimal(str(p["budget"]))
     left = budget - total
-
     FONT, FONT_BOLD = _register_cyrillic_fonts()
 
     out = io.BytesIO()
-    doc = SimpleDocTemplate(
-        out, pagesize=A4,
-        leftMargin=30, rightMargin=30, topMargin=30, bottomMargin=30,
-    )
-
+    doc = SimpleDocTemplate(out, pagesize=A4, leftMargin=30, rightMargin=30, topMargin=30, bottomMargin=30)
     title_style = ParagraphStyle("T",  fontName=FONT_BOLD, fontSize=22, leading=26, alignment=1)
     h2_style    = ParagraphStyle("H2", fontName=FONT_BOLD, fontSize=14, leading=18, spaceAfter=6)
     body_style  = ParagraphStyle("B",  fontName=FONT,      fontSize=11, leading=15)
-
     type_label = "Личный" if p["is_personal"] else "Командный"
 
     story = [
@@ -868,7 +772,6 @@ async def make_pdf(update, pid):
         Paragraph(f"Осталось: {money(left)}", body_style),
         Spacer(1, 12),
     ]
-
     data = [["Категория", "Наименование", "Кол-во", "Цена", "Сумма"]]
     for r in rows:
         qv = Decimal(str(r["qty"]))
@@ -888,23 +791,19 @@ async def make_pdf(update, pid):
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]))
     story.append(table)
-
     doc.build(story)
     out.seek(0)
     await q.message.reply_document(out, filename=f"smeta_{_safe_name(p['name'])}.pdf")
+
 
 # ---------- Команды ----------
 
 async def cmd_start(update, ctx):
     u = update.effective_user
     await upsert_user(u)
-
-    # Проверяем deep link: /start join_XXXX
     args = ctx.args or []
     if args and args[0].startswith("join_"):
-        code = args[0][5:]
-        return await handle_join_link(update, ctx, code)
-
+        return await handle_join_link(update, ctx, args[0][5:])
     text = (
         f"👋 Привет, {esc(u.first_name or 'друг')}!\n\n"
         "Это бот для <b>командной</b> работы со сметами.\n"
@@ -916,41 +815,24 @@ async def cmd_start(update, ctx):
 
 
 async def handle_join_link(update, ctx, code):
-    """Обрабатывает ссылку-приглашение /start join_XXXX."""
     u = update.effective_user
     async with pool.acquire() as c:
-        row = await c.fetchrow(
-            "SELECT project_id FROM invites WHERE code=$1", code
-        )
+        row = await c.fetchrow("SELECT project_id FROM invites WHERE code=$1", code)
     if not row:
-        return await update.message.reply_text(
-            "Ссылка-приглашение недействительна или устарела.",
-            reply_markup=kb_main(),
-        )
+        return await update.message.reply_text("Ссылка недействительна.", reply_markup=kb_main())
     pid = row["project_id"]
     async with pool.acquire() as c:
-        p = await c.fetchrow(
-            "SELECT id, name, is_personal FROM projects WHERE id=$1", pid
-        )
+        p = await c.fetchrow("SELECT id, name, is_personal FROM projects WHERE id=$1", pid)
     if not p:
-        return await update.message.reply_text(
-            "Проект больше не существует.",
-            reply_markup=kb_main(),
-        )
+        return await update.message.reply_text("Проект больше не существует.", reply_markup=kb_main())
     if p["is_personal"]:
-        return await update.message.reply_text(
-            "Этот проект сейчас личный — создатель отключил приглашения.",
-            reply_markup=kb_main(),
-        )
-
-    # Добавляем в участники, если ещё не там
+        return await update.message.reply_text("Этот проект сейчас личный.", reply_markup=kb_main())
     async with pool.acquire() as c:
         await c.execute(
             "INSERT INTO project_members(project_id, user_id, role) VALUES($1,$2,$3) "
             "ON CONFLICT (project_id, user_id) DO NOTHING",
             pid, u.id, ROLE_MEMBER,
         )
-
     await update.message.reply_text(
         f"✅ Вы присоединились к проекту «{esc(p['name'])}».",
         parse_mode=ParseMode.HTML,
@@ -964,12 +846,10 @@ async def cmd_menu(update, ctx):
 
 
 async def cmd_cancel(update, ctx):
-    for k in ("state", "exp", "new_project", "budget_pid", "invite_pid", "settings_pid"):
+    for k in ("state", "exp", "new_project", "budget_pid", "invite_pid", "delete_pid"):
         ctx.user_data.pop(k, None)
     await update.message.reply_text("Отменено.", reply_markup=kb_main())
 
-
-# ---------- Текстовый ввод ----------
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -977,18 +857,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state = ctx.user_data.get("state")
     text = (update.message.text or "").strip()
 
-    # если никакого активного диалога — можно быстрый ввод расхода,
-    # только если мы «внутри» проекта и есть право добавлять
     if not state:
         pid = ctx.user_data.get("current_project")
         if pid and await user_can_view_project(pid, u.id):
             parsed = parse_quick(text)
             if parsed:
                 name, qty, price = parsed
-                ctx.user_data["exp"] = {
-                    "project_id": pid,
-                    "name": name, "qty": str(qty), "price": str(price),
-                }
+                ctx.user_data["exp"] = {"project_id": pid, "name": name, "qty": str(qty), "price": str(price)}
                 ctx.user_data["state"] = "exp:category"
                 total = qty * price
                 return await update.message.reply_text(
@@ -996,35 +871,27 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"• Название: {esc(name)}\n"
                     f"• Количество: {fmt_qty(qty)}\n"
                     f"• Цена: {money(price)}\n"
-                    f"• Сумма: {money(total)}\n\n"
-                    "Выберите категорию:",
+                    f"• Сумма: {money(total)}\n\nВыберите категорию:",
                     parse_mode=ParseMode.HTML,
                     reply_markup=kb_categories(pid),
                 )
-        return await update.message.reply_text(
-            "Используйте /start для меню.",
-            reply_markup=kb_main(),
-        )
+        return await update.message.reply_text("Используйте /start для меню.", reply_markup=kb_main())
 
     if text.lower() in ("/cancel", "отмена"):
-        for k in ("state", "exp", "new_project", "budget_pid", "invite_pid", "settings_pid"):
+        for k in ("state", "exp", "new_project", "budget_pid", "invite_pid", "delete_pid"):
             ctx.user_data.pop(k, None)
         return await update.message.reply_text("Отменено.", reply_markup=kb_main())
 
-    # --- создание проекта: имя ---
     if state == "newp:name":
         if not text:
             return
         ctx.user_data["new_project"] = {"name": text}
         ctx.user_data["state"] = "newp:budget"
         return await update.message.reply_text(
-            f"Проект: <b>{esc(text)}</b>\n\n"
-            "Отправьте бюджет числом (₽). Например: 100000.\n"
-            "Если бюджет неизвестен — отправьте 0.",
+            f"Проект: <b>{esc(text)}</b>\n\nОтправьте бюджет числом (₽). Например: 100000.\nЕсли бюджет неизвестен — отправьте 0.",
             parse_mode=ParseMode.HTML,
         )
 
-    # --- создание проекта: бюджет ---
     if state == "newp:budget":
         val = parse_money(text)
         if val is None:
@@ -1034,13 +901,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["new_project"] = np
         ctx.user_data["state"] = "newp:type"
         return await update.message.reply_text(
-            f"Проект: <b>{esc(np.get('name',''))}</b>\n"
-            f"Бюджет: <b>{money(val)}</b>\n\n"
-            "Выберите тип проекта:",
+            f"Проект: <b>{esc(np.get('name',''))}</b>\nБюджет: <b>{money(val)}</b>\n\nВыберите тип проекта:",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_project_type(),
         )
-    # --- поиск расхода для удаления ---
+
     if state == "delete:search":
         pid = ctx.user_data.get("delete_pid")
         if not pid:
@@ -1051,41 +916,29 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text("Введите слово, например: такси")
         ctx.user_data.pop("state", None)
         ctx.user_data.pop("delete_pid", None)
-
         async with pool.acquire() as c:
             rows = await c.fetch(
-                """
-                SELECT id, name, qty, price, category
-                FROM expenses
-                WHERE project_id=$1 AND LOWER(name) LIKE $2
-                ORDER BY id DESC
-                LIMIT 25
-                """,
+                "SELECT id, name, qty, price, category FROM expenses WHERE project_id=$1 AND LOWER(name) LIKE $2 ORDER BY id DESC LIMIT 25",
                 pid, f"%{word.lower()}%",
             )
         if not rows:
             return await update.message.reply_text(
-                f"По слову «{esc(word)}» ничего не найдено.\n"
-                "Попробуйте другой вариант или /cancel.",
+                f"По слову «{esc(word)}» ничего не найдено.",
                 parse_mode=ParseMode.HTML,
             )
-
         kb_rows = []
         for r in rows:
             qv = Decimal(str(r["qty"]))
             pv = Decimal(str(r["price"]))
             s = qv * pv
             label = f"{r['category']} {r['name']} · {money(s)}"[:60]
-            kb_rows.append([
-                InlineKeyboardButton(label, callback_data=f"exp:delete_pick:{r['id']}")
-            ])
+            kb_rows.append([InlineKeyboardButton(label, callback_data=f"exp:delete_pick:{r['id']}")])
         kb_rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"exp:list:{pid}")])
-
         return await update.message.reply_text(
             f"Найдено: {len(rows)}. Выберите, что удалить:",
             reply_markup=InlineKeyboardMarkup(kb_rows),
         )
-    # --- приглашение по username ---
+
     if state == "invite:username":
         pid = ctx.user_data.get("invite_pid")
         if not pid:
@@ -1101,27 +954,20 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         if not target:
             return await update.message.reply_text(
-                f"Пользователь @{esc(uname)} не найден.\n"
-                "Попросите его сначала написать боту /start, потом попробуйте снова.",
+                f"Пользователь @{esc(uname)} не найден. Попросите его написать боту /start.",
                 parse_mode=ParseMode.HTML,
             )
-        # добавляем
         async with pool.acquire() as c:
             await c.execute(
-                "INSERT INTO project_members(project_id, user_id, role) VALUES($1,$2,$3) "
-                "ON CONFLICT (project_id, user_id) DO NOTHING",
+                "INSERT INTO project_members(project_id, user_id, role) VALUES($1,$2,$3) ON CONFLICT (project_id, user_id) DO NOTHING",
                 pid, target["user_id"], ROLE_MEMBER,
             )
         ctx.user_data.pop("state", None)
         ctx.user_data.pop("invite_pid", None)
         name = target["first_name"] or ("@" + (target["username"] or uname))
-        await update.message.reply_text(
-            f"✅ {esc(name)} добавлен(а) в проект.",
-            parse_mode=ParseMode.HTML,
-        )
+        await update.message.reply_text(f"✅ {esc(name)} добавлен(а) в проект.", parse_mode=ParseMode.HTML)
         return await send_project_msg(update.message, pid, edit=False, user_id=u.id)
 
-    # --- ввод расхода (старая логика) ---
     if state == "exp:name":
         exp = ctx.user_data.get("exp") or {}
         parsed = parse_quick(text)
@@ -1135,18 +981,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"• Название: {esc(name)}\n"
                 f"• Количество: {fmt_qty(qty)}\n"
                 f"• Цена: {money(price)}\n"
-                f"• Сумма: {money(qty*price)}\n\n"
-                "Выберите категорию:",
+                f"• Сумма: {money(qty*price)}\n\nВыберите категорию:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_categories(exp["project_id"]),
             )
         exp["name"] = text
         ctx.user_data["exp"] = exp
         ctx.user_data["state"] = "exp:qty"
-        return await update.message.reply_text(
-            f"Название: <b>{esc(text)}</b>\n\nСколько? (например 1, 3, 2.5)",
-            parse_mode=ParseMode.HTML,
-        )
+        return await update.message.reply_text(f"Название: <b>{esc(text)}</b>\n\nСколько? (например 1, 3, 2.5)", parse_mode=ParseMode.HTML)
 
     if state == "exp:qty":
         val = parse_number(text)
@@ -1175,11 +1017,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         exp = ctx.user_data["exp"]
         exp["comment"] = text
         ctx.user_data["state"] = "exp:confirm"
-        return await update.message.reply_text(
-            _exp_summary(exp),
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_confirm(exp["project_id"]),
-        )
+        return await update.message.reply_text(_exp_summary(exp), parse_mode=ParseMode.HTML, reply_markup=kb_confirm(exp["project_id"]))
 
     if state == "project:budget":
         val = parse_money(text)
@@ -1199,8 +1037,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Не понял. /cancel — отмена.", reply_markup=kb_main())
 
-# ---------- Обработка кнопок ----------
-
 async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1210,10 +1046,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # --- меню ---
     if data == "menu":
-        return await q.edit_message_text(
-            "Меню:",
-            reply_markup=kb_main(),
-        )
+        return await q.edit_message_text("Меню:", reply_markup=kb_main())
 
     # --- списки проектов ---
     if data == "projects:personal":
@@ -1229,9 +1062,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["state"] = "newp:name"
         ctx.user_data.pop("new_project", None)
         return await q.edit_message_text(
-            "➕ <b>Новый проект</b>\n\n"
-            "Шаг 1 из 3. Отправьте название проекта.\n\n"
-            "/cancel — отмена",
+            "➕ <b>Новый проект</b>\n\nШаг 1 из 3. Отправьте название проекта.\n\n/cancel — отмена",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_back("menu"),
         )
@@ -1246,29 +1077,19 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         budget = Decimal(np.get("budget", "0"))
         async with pool.acquire() as c:
             row = await c.fetchrow(
-                """
-                INSERT INTO projects(name, budget, creator_id, is_personal)
-                VALUES($1,$2,$3,$4) RETURNING id
-                """,
+                "INSERT INTO projects(name, budget, creator_id, is_personal) VALUES($1,$2,$3,$4) RETURNING id",
                 name, budget, u.id, is_personal,
             )
             pid = row["id"]
             await c.execute(
-                "INSERT INTO project_members(project_id, user_id, role) VALUES($1,$2,$3) "
-                "ON CONFLICT (project_id, user_id) DO NOTHING",
+                "INSERT INTO project_members(project_id, user_id, role) VALUES($1,$2,$3) ON CONFLICT (project_id, user_id) DO NOTHING",
                 pid, u.id, ROLE_OWNER,
             )
         ctx.user_data.pop("state", None)
         ctx.user_data.pop("new_project", None)
         ctx.user_data["current_project"] = pid
-
         type_label = "👤 Личный" if is_personal else "👥 Командный"
-        await q.edit_message_text(
-            f"✅ Проект «{esc(name)}» создан.\n"
-            f"Тип: {type_label}",
-            parse_mode=ParseMode.HTML,
-        )
-        # показываем проект
+        await q.edit_message_text(f"✅ Проект «{esc(name)}» создан.\nТип: {type_label}", parse_mode=ParseMode.HTML)
         return await send_project_msg(q.message, pid, edit=False, user_id=u.id)
 
     # --- открытие проекта ---
@@ -1289,16 +1110,10 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await q.edit_message_text("У вас нет доступа к этому проекту.")
         async with pool.acquire() as c:
             p = await c.fetchrow("SELECT * FROM projects WHERE id=$1", pid)
-            owner = await c.fetchrow(
-                "SELECT username, first_name FROM users WHERE user_id=$1",
-                p["creator_id"] if p else 0,
-            ) if p else None
+            owner = await c.fetchrow("SELECT username, first_name FROM users WHERE user_id=$1", p["creator_id"] if p else 0) if p else None
         if not p:
             return await q.edit_message_text("Проект не найден.")
-        owner_name = (
-            ("@" + owner["username"]) if owner and owner["username"]
-            else (owner["first_name"] if owner and owner["first_name"] else f"id{p['creator_id']}")
-        )
+        owner_name = ("@" + owner["username"]) if owner and owner["username"] else (owner["first_name"] if owner and owner["first_name"] else f"id{p['creator_id']}")
         created = p["created_at"].strftime("%d.%m.%Y") if p["created_at"] else ""
         type_label = "👤 Личный" if p["is_personal"] else "👥 Командный"
         text = (
@@ -1312,14 +1127,14 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         is_owner = await user_can_edit_project(pid, u.id)
         if is_owner:
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✏️ Изменить бюджет",   callback_data=f"project:budget:{pid}")],
-                [InlineKeyboardButton("🔄 Изменить тип",       callback_data=f"project:type:{pid}")],
-                [InlineKeyboardButton("👥 Пригласить",         callback_data=f"project:invite:{pid}")],
-                [InlineKeyboardButton("◀️ Назад к проекту",    callback_data=f"project:view:{pid}")],
+                [InlineKeyboardButton("✏️ Изменить бюджет", callback_data=f"project:budget:{pid}")],
+                [InlineKeyboardButton("🔄 Изменить тип",   callback_data=f"project:type:{pid}")],
+                [InlineKeyboardButton("👥 Пригласить",     callback_data=f"project:invite:{pid}")],
+                [InlineKeyboardButton("◀️ Назад к проекту", callback_data=f"project:view:{pid}")],
             ])
         else:
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("◀️ Назад к проекту",    callback_data=f"project:view:{pid}")],
+                [InlineKeyboardButton("◀️ Назад к проекту", callback_data=f"project:view:{pid}")],
             ])
         return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -1329,9 +1144,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await q.edit_message_text("Нет прав на изменение бюджета.")
         ctx.user_data["state"] = "project:budget"
         ctx.user_data["budget_pid"] = pid
-        return await q.edit_message_text(
-            "Отправьте новый бюджет числом (например 150000).\n\n/cancel — отмена."
-        )
+        return await q.edit_message_text("Отправьте новый бюджет числом (например 150000).\n\n/cancel — отмена.")
 
     # --- изменить тип ---
     if data.startswith("project:type:"):
@@ -1345,33 +1158,19 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cur = p["is_personal"]
         cur_label = "👤 Личный" if cur else "👥 Командный"
         new_label = "👥 Командный" if cur else "👤 Личный"
-        warn = ""
-        if not cur:
-            # командный → личный
-            warn = (
-                "\n\n⚠️ <b>Внимание:</b> все приглашённые потеряют доступ к проекту. "
-                "Их расходы сохранятся."
-            )
-        text = (
-            f"Проект: <b>{esc(p['name'])}</b>\n"
-            f"Сейчас: {cur_label}\n\n"
-            f"Сменить на: {new_label}?{warn}"
-        )
-        return await q.edit_message_text(text, parse_mode=ParseMode.HTML,
-                                         reply_markup=kb_change_type_menu(pid, cur))
+        warn = "\n\n⚠️ <b>Внимание:</b> все приглашённые потеряют доступ к проекту. Их расходы сохранятся." if not cur else ""
+        text = f"Проект: <b>{esc(p['name'])}</b>\nСейчас: {cur_label}\n\nСменить на: {new_label}?{warn}"
+        return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_change_type_menu(pid, cur))
 
     if data.startswith("project:type:team:") or data.startswith("project:type:personal:"):
         parts = data.split(":")
-        new_type = parts[2]  # 'team' или 'personal'
+        new_type = parts[2]
         pid = int(parts[3])
         if not await user_can_edit_project(pid, u.id):
             return await q.edit_message_text("Нет прав.")
         is_personal = (new_type == "personal")
         async with pool.acquire() as c:
-            await c.execute(
-                "UPDATE projects SET is_personal=$1 WHERE id=$2",
-                is_personal, pid,
-            )
+            await c.execute("UPDATE projects SET is_personal=$1 WHERE id=$2", is_personal, pid)
         label = "👤 Личный" if is_personal else "👥 Командный"
         await q.edit_message_text(f"✅ Тип проекта изменён на {label}.")
         return await send_project_msg(q.message, pid, edit=False, user_id=u.id)
@@ -1379,9 +1178,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # --- приглашение ---
     if data.startswith("project:invite:"):
         parts = data.split(":")
-        # project:invite:<pid>          → меню приглашения
-        # project:invite:user:<pid>     → ввод @username
-        # project:invite:link:<pid>     → показать ссылку
         if len(parts) == 3:
             pid = int(parts[2])
             if not await user_can_edit_project(pid, u.id):
@@ -1391,16 +1187,8 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not p:
                 return await q.edit_message_text("Проект не найден.")
             if p["is_personal"]:
-                return await q.edit_message_text(
-                    "Это личный проект. Сначала смените тип на «👥 Командный» "
-                    "в настройках проекта.",
-                )
-            return await q.edit_message_text(
-                "👥 <b>Пригласить в проект</b>\n\n"
-                "Выберите способ:",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_invite_menu(pid),
-            )
+                return await q.edit_message_text("Это личный проект. Сначала смените тип на «👥 Командный».")
+            return await q.edit_message_text("👥 <b>Пригласить в проект</b>\n\nВыберите способ:", parse_mode=ParseMode.HTML, reply_markup=kb_invite_menu(pid))
 
         if len(parts) == 4 and parts[2] == "user":
             pid = int(parts[3])
@@ -1409,9 +1197,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data["state"] = "invite:username"
             ctx.user_data["invite_pid"] = pid
             return await q.edit_message_text(
-                "Отправьте username пользователя, например: <code>@vasya</code>\n\n"
-                "⚠️ Пользователь должен хотя бы раз написать боту /start.\n\n"
-                "/cancel — отмена.",
+                "Отправьте username пользователя, например: <code>@vasya</code>\n\n⚠️ Пользователь должен хотя бы раз написать боту /start.\n\n/cancel — отмена.",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -1424,22 +1210,18 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not p:
                 return await q.edit_message_text("Проект не найден.")
             if p["is_personal"]:
-                return await q.edit_message_text(
-                    "Это личный проект. Сначала смените тип на «👥 Командный»."
-                )
+                return await q.edit_message_text("Это личный проект. Сначала смените тип на «👥 Командный».")
             code = await get_or_create_invite_code(pid)
             link = invite_link(code)
             return await q.edit_message_text(
-                f"🔗 <b>Ссылка-приглашение</b>\n\n"
-                f"<code>{esc(link)}</code>\n\n"
-                "Отправьте её другу. Он нажмёт, и сразу попадёт в проект.",
+                f"🔗 <b>Ссылка-приглашение</b>\n\n<code>{esc(link)}</code>\n\nОтправьте её другу.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("◀️ Назад", callback_data=f"project:invite:{pid}")],
                 ]),
             )
 
-    # --- удаление ---
+    # --- удаление проекта ---
     if data.startswith("project:delete:"):
         pid = int(data.split(":")[2])
         if not await user_can_edit_project(pid, u.id):
@@ -1448,10 +1230,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🗑 Да, удалить", callback_data=f"project:delete_yes:{pid}")],
             [InlineKeyboardButton("◀️ Отмена",      callback_data=f"project:view:{pid}")],
         ])
-        return await q.edit_message_text(
-            "Удалить проект и все его расходы? Действие необратимо.",
-            reply_markup=kb,
-        )
+        return await q.edit_message_text("Удалить проект и все его расходы? Действие необратимо.", reply_markup=kb)
 
     if data.startswith("project:delete_yes:"):
         pid = int(data.split(":")[2])
@@ -1492,10 +1271,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await q.edit_message_text("У вас нет доступа к этому проекту.")
         async with pool.acquire() as c:
             p = await c.fetchrow("SELECT * FROM projects WHERE id=$1", pid)
-            rows = await c.fetch(
-                "SELECT * FROM expenses WHERE project_id=$1 ORDER BY id DESC LIMIT 100",
-                pid,
-            )
+            rows = await c.fetch("SELECT * FROM expenses WHERE project_id=$1 ORDER BY id DESC LIMIT 100", pid)
         if not p:
             return await q.edit_message_text("Проект не найден.")
         if not rows:
@@ -1507,10 +1283,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 qv = Decimal(str(r["qty"]))
                 pv = Decimal(str(r["price"]))
                 s = qv * pv
-                author = (
-                    ("@" + r["author_username"]) if r["author_username"]
-                    else (f"id{r['author_id']}" if r["author_id"] else "—")
-                )
+                author = ("@" + r["author_username"]) if r["author_username"] else (f"id{r['author_id']}" if r["author_id"] else "—")
                 dt = r["created_at"].strftime("%d.%m.%Y %H:%M") if r["created_at"] else ""
                 block = [
                     f"{esc(r['category'])}",
@@ -1525,21 +1298,20 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = f"📋 <b>Расходы проекта «{esc(p['name'])}»</b>\n\n{body}"
         if len(text) > 4000:
             text = text[:3900] + "\n\n… (показаны не все)"
-              kb = InlineKeyboardMarkup([
+        kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Добавить расход", callback_data=f"exp:add:{pid}")],
             [InlineKeyboardButton("🗑 Удалить расход",  callback_data=f"exp:delete:{pid}")],
             [InlineKeyboardButton("◀️ Назад к проекту", callback_data=f"project:view:{pid}")],
         ])
         return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
     # --- удаление расхода ---
     if data.startswith("exp:delete:"):
         pid = int(data.split(":")[2])
         if not await user_can_view_project(pid, u.id):
             return await q.edit_message_text("У вас нет доступа к этому проекту.")
         async with pool.acquire() as c:
-            cnt = await c.fetchval(
-                "SELECT COUNT(*) FROM expenses WHERE project_id=$1", pid
-            )
+            cnt = await c.fetchval("SELECT COUNT(*) FROM expenses WHERE project_id=$1", pid)
         if cnt == 0:
             return await q.edit_message_text(
                 "Расходов нет.",
@@ -1553,8 +1325,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await q.edit_message_text(
                 f"В проекте {cnt} расходов. Слишком много для списка.\n\n"
                 "Введите часть названия расхода, который хотите удалить.\n"
-                "Например: <code>такси</code>\n\n"
-                "/cancel — отмена",
+                "Например: <code>такси</code>\n\n/cancel — отмена",
                 parse_mode=ParseMode.HTML,
             )
         return await show_delete_choices(q, ctx, pid, u.id)
@@ -1562,10 +1333,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("exp:delete_pick:"):
         eid = int(data.split(":")[2])
         async with pool.acquire() as c:
-            e = await c.fetchrow(
-                "SELECT id, project_id, name, qty, price, category FROM expenses WHERE id=$1",
-                eid,
-            )
+            e = await c.fetchrow("SELECT id, project_id, name, qty, price, category FROM expenses WHERE id=$1", eid)
         if not e:
             return await q.edit_message_text("Расход уже удалён.")
         if not await user_can_view_project(e["project_id"], u.id):
@@ -1573,12 +1341,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         qv = Decimal(str(e["qty"]))
         pv = Decimal(str(e["price"]))
         s = qv * pv
-        text = (
-            "Удалить этот расход?\n\n"
-            f"{esc(e['category'])}\n"
-            f"<b>{esc(e['name'])}</b>\n"
-            f"{fmt_qty(qv)} × {money(pv)} = <b>{money(s)}</b>"
-        )
+        text = f"Удалить этот расход?\n\n{esc(e['category'])}\n<b>{esc(e['name'])}</b>\n{fmt_qty(qv)} × {money(pv)} = <b>{money(s)}</b>"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑 Да, удалить", callback_data=f"exp:delete_yes:{eid}")],
             [InlineKeyboardButton("❌ Отмена",      callback_data=f"exp:list:{e['project_id']}")],
@@ -1588,9 +1351,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("exp:delete_yes:"):
         eid = int(data.split(":")[2])
         async with pool.acquire() as c:
-            e = await c.fetchrow(
-                "SELECT project_id FROM expenses WHERE id=$1", eid
-            )
+            e = await c.fetchrow("SELECT project_id FROM expenses WHERE id=$1", eid)
         if not e:
             return await q.edit_message_text("Расход уже удалён.")
         pid = e["project_id"]
@@ -1601,6 +1362,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("✅ Расход удалён.")
         text, kb = await project_view(pid, user_id=u.id)
         return await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
     # --- выбор категории ---
     if data.startswith("cat:"):
         _, pid_s, idx_s = data.split(":")
@@ -1623,11 +1385,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         exp["comment"] = None
         ctx.user_data["exp"] = exp
         ctx.user_data["state"] = "exp:confirm"
-        return await q.edit_message_text(
-            _exp_summary(exp),
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_confirm(pid),
-        )
+        return await q.edit_message_text(_exp_summary(exp), parse_mode=ParseMode.HTML, reply_markup=kb_confirm(pid))
 
     if data.startswith("exp:save:"):
         pid = int(data.split(":")[2])
@@ -1644,8 +1402,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async with pool.acquire() as c:
             await c.execute(
                 """
-                INSERT INTO expenses(project_id, category, name, qty, price,
-                                     comment, author_id, author_username)
+                INSERT INTO expenses(project_id, category, name, qty, price, comment, author_id, author_username)
                 VALUES($1,$2,$3,$4,$5,$6,$7,$8)
                 """,
                 pid, cat, name, qty, price, comment, u.id, u.username,
@@ -1654,11 +1411,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("exp", None)
         ctx.user_data["current_project"] = pid
         text, kb = await project_view(pid, user_id=u.id)
-        return await q.edit_message_text(
-            "✅ Расход добавлен.\n\n" + text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-        )
+        return await q.edit_message_text("✅ Расход добавлен.\n\n" + text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
     if data.startswith("exp:cancel:"):
         pid = int(data.split(":")[2])
@@ -1667,13 +1420,9 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not await user_can_view_project(pid, u.id):
             return await q.edit_message_text("Отменено.", reply_markup=kb_main())
         text, kb = await project_view(pid, user_id=u.id)
-        return await q.edit_message_text(
-            "Отменено.\n\n" + text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-        )
+        return await q.edit_message_text("Отменено.\n\n" + text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    # --- экспорт Excel/PDF ---
+    # --- экспорт ---
     if data.startswith("excel:"):
         try:
             pid = int(data.split(":")[1])
@@ -1690,8 +1439,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     log.warning("Unhandled callback: %s", data)
 
-
-# ---------- Запуск ----------
 
 async def post_init(app):
     global bot_username
