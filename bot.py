@@ -45,6 +45,13 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 pool = None
 bot_username = None
 
+# Белый список Telegram ID (кому разрешён доступ)
+ALLOWED_USER_IDS = [
+    778239050,
+    908061079,
+    304434109,
+]
+
 CATEGORIES = [
     "🎬 Аренда",
     "📍 Локация",
@@ -376,28 +383,6 @@ def _sort_rows_by_category(rows):
             r["id"],
         ),
     )
-
-
-def _category_summary(rows):
-    """Возвращает список (category, total, count) по категориям в порядке CATEGORIES."""
-    agg = {}
-    for r in rows:
-        cat = r["category"]
-        qv = Decimal(str(r["qty"]))
-        pv = Decimal(str(r["price"]))
-        s = qv * pv
-        if cat not in agg:
-            agg[cat] = {"total": Decimal(0), "count": 0}
-        agg[cat]["total"] += s
-        agg[cat]["count"] += 1
-    result = []
-    for cat in CATEGORIES:
-        if cat in agg:
-            result.append((cat, agg[cat]["total"], agg[cat]["count"]))
-    for cat, v in agg.items():
-        if cat not in CATEGORY_ORDER:
-            result.append((cat, v["total"], v["count"]))
-    return result
 
 
 def _register_cyrillic_fonts():
@@ -736,44 +721,6 @@ async def show_edit_choices(target, pid, user_id, query=None):
     return await target.edit_message_text(header, reply_markup=InlineKeyboardMarkup(kb_rows))
 
 
-async def show_search_results(target, pid, user_id, query):
-    """Показывает найденные расходы. Если один — открывает карточку сразу."""
-    async with pool.acquire() as c:
-        rows = await c.fetch(
-            """
-            SELECT id, name, qty, price, category, comment, author_username, author_id, created_at
-            FROM expenses
-            WHERE project_id=$1 AND (LOWER(name) LIKE $2 OR LOWER(category) LIKE $2 OR LOWER(COALESCE(comment,'')) LIKE $2)
-            ORDER BY id DESC
-            LIMIT 25
-            """,
-            pid, f"%{query.lower()}%",
-        )
-    if not rows:
-        return await target.edit_message_text(
-            f"По запросу «{esc(query)}» ничего не найдено.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔍 Искать ещё",  callback_data=f"exp:search:{pid}")],
-                [InlineKeyboardButton("◀️ К расходам", callback_data=f"exp:list:{pid}")],
-            ]),
-        )
-    kb_rows = []
-    for r in rows:
-        qv = Decimal(str(r["qty"]))
-        pv = Decimal(str(r["price"]))
-        s = qv * pv
-        label = f"{r['category']} {r['name']} · {money(s)}"[:60]
-        kb_rows.append([InlineKeyboardButton(label, callback_data=f"exp:search_pick:{r['id']}")])
-    kb_rows.append([InlineKeyboardButton("🔍 Искать ещё",  callback_data=f"exp:search:{pid}")])
-    kb_rows.append([InlineKeyboardButton("◀️ К расходам", callback_data=f"exp:list:{pid}")])
-    return await target.edit_message_text(
-        f"🔍 Найдено по «{esc(query)}»: {len(rows)}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(kb_rows),
-    )
-
-
 async def finish_edit(update, ctx):
     edit = ctx.user_data.get("edit_exp")
     if not edit:
@@ -802,7 +749,6 @@ async def finish_edit(update, ctx):
     await update.message.reply_text("✅ Расход обновлён.")
     text, kb = await project_view(pid, user_id=uid)
     return await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-
 
 # ---------- Excel ----------
 
@@ -863,7 +809,7 @@ async def make_excel(update, pid):
     wb.save(buf)
     buf.seek(0)
     await q.message.reply_document(buf, filename=f"smeta_{_safe_name(p['name'])}.xlsx")
-    
+
 
 # ---------- PDF ----------
 
@@ -923,62 +869,14 @@ async def make_pdf(update, pid):
     doc.build(story)
     out.seek(0)
     await q.message.reply_document(out, filename=f"smeta_{_safe_name(p['name'])}.pdf")
-    # --- СВОДКА ПО КАТЕГОРИЯМ ---
-    if summary:
-        story.append(Paragraph("Итоги по категориям", section_style))
-        sum_data = [["Категория", "Сумма", "Кол-во"]]
-        for cat, cat_total, cat_count in summary:
-            sum_data.append([cat, money(cat_total), str(cat_count)])
-        sum_data.append(["ИТОГО", money(total), str(len(rows))])
-        sum_table = Table(sum_data, repeatRows=1, colWidths=[280, 130, 70])
-        sum_table.setStyle(TableStyle([
-            ("GRID", (0, 0), (-1, -1), .4, colors.grey),
-            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-            ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
-            ("FONTNAME", (0, 1), (-1, -2), FONT),
-            ("FONTNAME", (0, -1), (-1, -1), FONT_BOLD),
-            ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ]))
-        story.append(sum_table)
-        story.append(Spacer(1, 14))
 
-    # --- ДЕТАЛЬНЫЕ РАСХОДЫ ---
-    story.append(Paragraph("Детальные расходы", section_style))
-    data = [["Категория", "Наименование", "Кол-во", "Цена", "Сумма"]]
-    for r in rows:
-        qv = Decimal(str(r["qty"]))
-        pv = Decimal(str(r["price"]))
-        s = qv * pv
-        data.append([r["category"], r["name"], fmt_qty(qv), money(pv), money(s)])
-    data.append(["", "", "", "ИТОГО", money(total)])
 
-    table = Table(data, repeatRows=1, colWidths=[95, 170, 55, 75, 85])
-    table.setStyle(TableStyle([
-        ("GRID", (0, 0), (-1, -1), .4, colors.grey),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-        ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
-        ("FONTNAME", (0, 1), (-1, -2), FONT),
-        ("FONTNAME", (0, -1), (-1, -1), FONT_BOLD),
-        ("ALIGN", (2, 1), (-1, -1), "RIGHT"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
-    story.append(table)
-
-    doc.build(story)
-    out.seek(0)
-    await q.message.reply_document(out, filename=f"smeta_{_safe_name(p['name'])}.pdf")
-
-# Белый список Telegram ID (кому разрешён доступ)
-ALLOWED_USER_IDS = [
-    778239050,   # ← твой ID
-    908061079,
-    304434109,   # ← ID друга (если нужен)
-]
 # ---------- Команды ----------
 
 async def cmd_start(update, ctx):
     u = update.effective_user
+    if u.id not in ALLOWED_USER_IDS:
+        return await update.message.reply_text("Извините, доступ к боту закрыт.")
     await upsert_user(u)
     args = ctx.args or []
     if args and args[0].startswith("join_"):
@@ -1020,7 +918,10 @@ async def handle_join_link(update, ctx, code):
 
 
 async def cmd_menu(update, ctx):
-    await upsert_user(update.effective_user)
+    u = update.effective_user
+    if u.id not in ALLOWED_USER_IDS:
+        return await update.message.reply_text("Извините, доступ к боту закрыт.")
+    await upsert_user(u)
     await update.message.reply_text("Меню:", reply_markup=kb_main())
 
 
@@ -1031,6 +932,8 @@ async def cmd_cancel(update, ctx):
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+    if u.id not in ALLOWED_USER_IDS:
+        return
     await upsert_user(u)
     state = ctx.user_data.get("state")
     text = (update.message.text or "").strip()
@@ -1085,7 +988,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_project_type(),
         )
 
-    # --- поиск расхода для удаления ---
+    # --- поиск для удаления ---
     if state == "delete:search":
         pid = ctx.user_data.get("delete_pid")
         if not pid:
@@ -1111,7 +1014,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb_rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"exp:list:{pid}")])
         return await update.message.reply_text(f"Найдено: {len(rows)}. Выберите, что удалить:", reply_markup=InlineKeyboardMarkup(kb_rows))
 
-    # --- поиск расхода для редактирования ---
+    # --- поиск для редактирования ---
     if state == "edit:search":
         pid = ctx.user_data.get("edit_pid")
         if not pid:
@@ -1137,7 +1040,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb_rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"exp:list:{pid}")])
         return await update.message.reply_text(f"Найдено: {len(rows)}. Выберите, что редактировать:", reply_markup=InlineKeyboardMarkup(kb_rows))
 
-    # --- ПОИСК РАСХОДА (общий) ---
+    # --- ПОИСК (общий) ---
     if state == "search:query":
         pid = ctx.user_data.get("search_pid")
         if not pid:
@@ -1147,10 +1050,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not word:
             return await update.message.reply_text("Введите слово для поиска.")
         ctx.user_data.pop("state", None)
-        ctx.user_data.pop("search_pid", None)
-        # сохраняем pid, чтобы искать «ещё»
         ctx.user_data["search_pid"] = pid
-        # создаём «фейковый» target для show_search_results
         return await _send_search_results_msg(update, pid, word)
 
     # --- редактирование ---
@@ -1252,7 +1152,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ {esc(name)} добавлен(а) в проект.", parse_mode=ParseMode.HTML)
         return await send_project_msg(update.message, pid, edit=False, user_id=u.id)
 
-    # --- расход (добавление) ---
+    # --- расход ---
     if state == "exp:name":
         exp = ctx.user_data.get("exp") or {}
         parsed = parse_quick(text)
@@ -1324,7 +1224,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _send_search_results_msg(update, pid, query):
-    """Отправляет результаты поиска как новое сообщение (для текстового ввода)."""
     async with pool.acquire() as c:
         rows = await c.fetch(
             """
@@ -1364,6 +1263,8 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data or ""
     u = update.effective_user
+    if u.id not in ALLOWED_USER_IDS:
+        return
     await upsert_user(u)
 
     if data == "menu":
@@ -1613,9 +1514,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["state"] = "search:query"
         ctx.user_data["search_pid"] = pid
         return await q.edit_message_text(
-            "🔍 <b>Поиск по расходам</b>\n\n"
-            "Введите слово или часть названия, категории или комментария.\n"
-            "Например: <code>такси</code>\n\n/cancel — отмена.",
+            "🔍 <b>Поиск по расходам</b>\n\nВведите слово или часть названия, категории или комментария.\nНапример: <code>такси</code>\n\n/cancel — отмена.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("◀️ К расходам", callback_data=f"exp:list:{pid}")],
@@ -1667,9 +1566,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if cnt > 25:
             ctx.user_data["state"] = "edit:search"
             ctx.user_data["edit_pid"] = pid
-            return await q.edit_message_text(
-                f"В проекте {cnt} расходов. Введите часть названия для поиска.\n\n/cancel — отмена.",
-            )
+            return await q.edit_message_text(f"В проекте {cnt} расходов. Введите часть названия для поиска.\n\n/cancel — отмена.")
         return await show_edit_choices(q, pid, u.id)
 
     if data.startswith("exp:edit_pick:"):
@@ -1823,7 +1720,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, kb = await project_view(pid, user_id=u.id)
         return await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    # --- выбор категории (новая трата) ---
+    # --- категории (новая трата) ---
     if data.startswith("cat:"):
         _, pid_s, idx_s = data.split(":")
         pid = int(pid_s)
