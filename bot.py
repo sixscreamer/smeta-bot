@@ -969,7 +969,11 @@ async def make_pdf(update, pid):
     out.seek(0)
     await q.message.reply_document(out, filename=f"smeta_{_safe_name(p['name'])}.pdf")
 
-
+# Белый список Telegram ID (кому разрешён доступ)
+ALLOWED_USER_IDS = [
+    778239050,   # ← твой ID
+    908061079,   # ← ID друга (если нужен)
+]
 # ---------- Команды ----------
 
 async def cmd_start(update, ctx):
