@@ -33,6 +33,8 @@ from reportlab.platypus import (
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
+from async_yookassa import YooKassaClient
+from async_yookassa.models.payment import PaymentRequest, Amount, RedirectConfirmationRequest
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -41,7 +43,9 @@ log = logging.getLogger("smeta")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
-
+YOOKASSA_SHOP_ID = os.environ.get("YOOKASSA_SHOP_ID", "")
+YOOKASSA_SECRET_KEY = os.environ.get("YOOKASSA_SECRET_KEY", "")
+YOOKASSA_RETURN_URL = os.environ.get("YOOKASSA_RETURN_URL", "https://t.me")
 pool = None
 bot_username = None
 
@@ -125,6 +129,20 @@ CREATE TABLE IF NOT EXISTS expenses (
 CREATE INDEX IF NOT EXISTS idx_expenses_project ON expenses(project_id);
 CREATE INDEX IF NOT EXISTS idx_members_user     ON project_members(user_id);
 CREATE INDEX IF NOT EXISTS idx_members_project  ON project_members(project_id);
+CREATE TABLE IF NOT EXISTS payments (
+    id            SERIAL PRIMARY KEY,
+    user_id       BIGINT NOT NULL,
+    payment_id    TEXT NOT NULL UNIQUE,
+    amount        NUMERIC(14,2) NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+    user_id       BIGINT PRIMARY KEY,
+    expires_at    TIMESTAMPTZ NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
 
@@ -168,6 +186,92 @@ async def init_db():
     log.info("DB schema ready")
 
 
+
+# ---------- ЮKassa ----------
+
+async def create_yookassa_payment(user_id, amount, description="Доступ к боту"):
+    """Создаёт платёж и возвращает ссылку на оплату."""
+    if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+        return None, "Платежи временно недоступны."
+
+    try:
+        async with YooKassaClient(
+            account_id=YOOKASSA_SHOP_ID,
+            secret_key=YOOKASSA_SECRET_KEY,
+        ) as client:
+            request = PaymentRequest(
+                amount=Amount(value=f"{amount:.2f}", currency="RUB"),
+                confirmation=RedirectConfirmationRequest(
+                    type="redirect",
+                    return_url=YOOKASSA_RETURN_URL,
+                ),
+                description=description,
+                capture=True,
+                metadata={"user_id": str(user_id)},
+            )
+            payment = await client.payment.create(request)
+
+            # сохраняем в БД
+            async with pool.acquire() as c:
+                await c.execute(
+                    "INSERT INTO payments(user_id, payment_id, amount, status) "
+                    "VALUES($1,$2,$3,$4)",
+                    user_id, payment.id, amount, payment.status,
+                )
+
+            return payment.confirmation.confirmation_url, None
+    except Exception as e:
+        log.error("YooKassa create payment failed: %s", e)
+        return None, "Не удалось создать платёж. Попробуйте позже."
+
+
+async def check_yookassa_payment(user_id, payment_id):
+    """Проверяет статус платежа и выдаёт подписку на 30 дней, если оплачен."""
+    if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+        return False, "Платежи недоступны."
+
+    try:
+        async with YooKassaClient(
+            account_id=YOOKASSA_SHOP_ID,
+            secret_key=YOOKASSA_SECRET_KEY,
+        ) as client:
+            payment = await client.payment.get(payment_id)
+
+            if payment.status == "succeeded":
+                # обновляем статус в БД
+                async with pool.acquire() as c:
+                    await c.execute(
+                        "UPDATE payments SET status='succeeded' WHERE payment_id=$1",
+                        payment_id,
+                    )
+                    # продлеваем подписку на 30 дней от текущей даты или от конца текущей
+                    await c.execute(
+                        """
+                        INSERT INTO subscriptions(user_id, expires_at, updated_at)
+                        VALUES($1, NOW() + INTERVAL '30 days', NOW())
+                        ON CONFLICT (user_id) DO UPDATE
+                        SET expires_at = GREATEST(subscriptions.expires_at, NOW()) + INTERVAL '30 days',
+                            updated_at = NOW()
+                        """,
+                        user_id,
+                    )
+                return True, "Оплата прошла! Доступ активирован на 30 дней."
+            else:
+                return False, f"Статус платежа: {payment.status}. Попробуйте позже."
+
+    except Exception as e:
+        log.error("YooKassa check payment failed: %s", e)
+        return False, "Не удалось проверить платёж."
+
+
+async def user_has_subscription(user_id):
+    """Проверяет, активна ли подписка."""
+    async with pool.acquire() as c:
+        row = await c.fetchrow(
+            "SELECT expires_at FROM subscriptions WHERE user_id=$1 AND expires_at > NOW()",
+            user_id,
+        )
+    return row is not None
 async def upsert_user(u):
     if u is None:
         return
@@ -413,9 +517,10 @@ def _register_cyrillic_fonts():
 
 def kb_main():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 Личные проекты",    callback_data="projects:personal")],
+        [InlineKeyboardButton("👤 Личные проекты",   callback_data="projects:personal")],
         [InlineKeyboardButton("👥 Командные проекты", callback_data="projects:team")],
-        [InlineKeyboardButton("➕ Новый проект",       callback_data="project:new")],
+        [InlineKeyboardButton("➕ Новый проект",      callback_data="project:new")],
+        [InlineKeyboardButton("💎 Купить доступ",    callback_data="buy:access")],
     ])
 
 
@@ -1673,7 +1778,80 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("❌ Отмена",   callback_data=f"exp:list:{edit['project_id']}")],
             ]),
         )
+    # --- покупка доступа ---
+    if data == "buy:access":
+        # проверяем, есть ли уже подписка
+        if await user_has_subscription(u.id):
+            async with pool.acquire() as c:
+                row = await c.fetchrow(
+                    "SELECT expires_at FROM subscriptions WHERE user_id=$1",
+                    u.id,
+                )
+            exp = row["expires_at"].strftime("%d.%m.%Y") if row else "—"
+            return await q.edit_message_text(
+                f"💎 У вас уже есть доступ до <b>{exp}</b>.\n\n"
+                "Продлить можно, нажав кнопку ниже.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Продлить на 30 дней — 500 ₽", callback_data="buy:pay")],
+                    [InlineKeyboardButton("◀️ Назад", callback_data="menu")],
+                ]),
+            )
+        return await q.edit_message_text(
+            "💎 <b>Доступ к боту</b>\n\n"
+            "Подписка на 30 дней — <b>500 ₽</b>.\n\n"
+            "После оплаты доступ активируется автоматически.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Оплатить 500 ₽", callback_data="buy:pay")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="menu")],
+            ]),
+        )
 
+    if data == "buy:pay":
+        await q.edit_message_text("⏳ Создаю платёж...")
+        link, err = await create_yookassa_payment(u.id, 500)
+        if not link:
+            return await q.edit_message_text(
+                f"❌ {err}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Назад", callback_data="menu")],
+                ]),
+            )
+        return await q.edit_message_text(
+            "💎 <b>Оплата доступа</b>\n\n"
+            "Нажмите кнопку ниже, чтобы перейти на страницу оплаты.\n"
+            "После оплаты вернитесь в бота и нажмите «Я оплатил».",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔗 Перейти к оплате", url=link)],
+                [InlineKeyboardButton("✅ Я оплатил", callback_data="buy:check")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="menu")],
+            ]),
+        )
+
+    if data == "buy:check":
+        # ищем последний pending платёж пользователя
+        async with pool.acquire() as c:
+            row = await c.fetchrow(
+                "SELECT payment_id FROM payments WHERE user_id=$1 AND status='pending' "
+                "ORDER BY created_at DESC LIMIT 1",
+                u.id,
+            )
+        if not row:
+            return await q.edit_message_text(
+                "❌ Не нашли активный платёж. Попробуйте ещё раз.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ Назад", callback_data="menu")],
+                ]),
+            )
+        ok, msg = await check_yookassa_payment(u.id, row["payment_id"])
+        return await q.edit_message_text(
+            f"{'✅' if ok else '⏳'} {msg}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ В меню", callback_data="menu")],
+            ]),
+        )
     # --- УДАЛЕНИЕ ---
     if data.startswith("exp:delete:"):
         pid = int(data.split(":")[2])
