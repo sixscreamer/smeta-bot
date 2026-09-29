@@ -238,7 +238,6 @@ def invite_link(code):
         return f"https://t.me/?start=join_{code}"
     return f"https://t.me/{bot_username}?start=join_{code}"
 
-# ---------- Деньги и форматирование ----------
 
 def money(v) -> str:
     if v is None:
@@ -402,7 +401,6 @@ def _register_cyrillic_fonts():
     else:
         font_bold = "Helvetica-Bold"
     return font, font_bold
-
 
 # ---------- Клавиатуры ----------
 
@@ -629,6 +627,7 @@ def _exp_summary(exp):
         lines.append(f"• Комментарий: {esc(exp['comment'])}")
     return "\n".join(lines)
 
+
 async def show_delete_choices(target, ctx, pid, user_id, query=None):
     async with pool.acquire() as c:
         p = await c.fetchrow("SELECT name FROM projects WHERE id=$1", pid)
@@ -676,6 +675,81 @@ async def show_delete_choices(target, ctx, pid, user_id, query=None):
     header = f"Найдено по запросу «{esc(query)}»: {len(rows)}" if query else f"Всего расходов: {len(rows)}. Выберите, что удалить:"
 
     return await target.edit_message_text(header, reply_markup=InlineKeyboardMarkup(kb_rows))
+
+
+async def show_edit_choices(target, pid, user_id, query=None):
+    async with pool.acquire() as c:
+        if query:
+            rows = await c.fetch(
+                """
+                SELECT id, name, qty, price, category
+                FROM expenses
+                WHERE project_id=$1 AND LOWER(name) LIKE $2
+                ORDER BY id DESC
+                LIMIT 25
+                """,
+                pid, f"%{query.lower()}%",
+            )
+        else:
+            rows = await c.fetch(
+                """
+                SELECT id, name, qty, price, category
+                FROM expenses
+                WHERE project_id=$1
+                ORDER BY id DESC
+                LIMIT 25
+                """,
+                pid,
+            )
+    if not rows:
+        return await target.edit_message_text(
+            "Ничего не найдено. Попробуйте другое слово." if query else "Расходов нет.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ К расходам", callback_data=f"exp:list:{pid}")],
+            ]),
+        )
+
+    kb_rows = []
+    for r in rows:
+        qv = Decimal(str(r["qty"]))
+        pv = Decimal(str(r["price"]))
+        s = qv * pv
+        label = f"{r['category']} {r['name']} · {money(s)}"[:60]
+        kb_rows.append([InlineKeyboardButton(label, callback_data=f"exp:edit_pick:{r['id']}")])
+    kb_rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"exp:list:{pid}")])
+
+    header = f"Найдено по запросу «{esc(query)}»: {len(rows)}" if query else f"Всего расходов: {len(rows)}. Выберите, что редактировать:"
+
+    return await target.edit_message_text(header, reply_markup=InlineKeyboardMarkup(kb_rows))
+
+async def finish_edit(update, ctx):
+    edit = ctx.user_data.get("edit_exp")
+    if not edit:
+        ctx.user_data.pop("state", None)
+        if update.callback_query:
+            return await update.callback_query.edit_message_text("Что-то пошло не так.")
+        return await update.message.reply_text("Что-то пошло не так.", reply_markup=kb_main())
+    async with pool.acquire() as c:
+        await c.execute(
+            """
+            UPDATE expenses
+            SET name=$1, qty=$2, price=$3, category=$4, comment=$5
+            WHERE id=$6
+            """,
+            edit["name"], Decimal(edit["qty"]), Decimal(edit["price"]),
+            edit["category"], edit.get("comment"), edit["id"],
+        )
+    pid = edit["project_id"]
+    uid = update.effective_user.id
+    ctx.user_data.pop("state", None)
+    ctx.user_data.pop("edit_exp", None)
+    if update.callback_query:
+        await update.callback_query.edit_message_text("✅ Расход обновлён.")
+        text, kb = await project_view(pid, user_id=uid)
+        return await update.callback_query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await update.message.reply_text("✅ Расход обновлён.")
+    text, kb = await project_view(pid, user_id=uid)
+    return await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 # ---------- Excel ----------
@@ -846,10 +920,9 @@ async def cmd_menu(update, ctx):
 
 
 async def cmd_cancel(update, ctx):
-    for k in ("state", "exp", "new_project", "budget_pid", "invite_pid", "delete_pid"):
+    for k in ("state", "exp", "new_project", "budget_pid", "invite_pid", "delete_pid", "edit_pid", "edit_exp"):
         ctx.user_data.pop(k, None)
     await update.message.reply_text("Отменено.", reply_markup=kb_main())
-
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -878,10 +951,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Используйте /start для меню.", reply_markup=kb_main())
 
     if text.lower() in ("/cancel", "отмена"):
-        for k in ("state", "exp", "new_project", "budget_pid", "invite_pid", "delete_pid"):
+        for k in ("state", "exp", "new_project", "budget_pid", "invite_pid", "delete_pid", "edit_pid", "edit_exp"):
             ctx.user_data.pop(k, None)
         return await update.message.reply_text("Отменено.", reply_markup=kb_main())
 
+    # --- создание проекта: имя ---
     if state == "newp:name":
         if not text:
             return
@@ -892,6 +966,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
+    # --- создание проекта: бюджет ---
     if state == "newp:budget":
         val = parse_money(text)
         if val is None:
@@ -906,6 +981,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_project_type(),
         )
 
+    # --- поиск расхода для удаления ---
     if state == "delete:search":
         pid = ctx.user_data.get("delete_pid")
         if not pid:
@@ -939,6 +1015,119 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(kb_rows),
         )
 
+    # --- поиск расхода для редактирования ---
+    if state == "edit:search":
+        pid = ctx.user_data.get("edit_pid")
+        if not pid:
+            ctx.user_data.pop("state", None)
+            return await update.message.reply_text("Что-то пошло не так.", reply_markup=kb_main())
+        word = text.strip()
+        if not word:
+            return await update.message.reply_text("Введите слово, например: такси")
+        ctx.user_data.pop("state", None)
+        ctx.user_data.pop("edit_pid", None)
+        async with pool.acquire() as c:
+            rows = await c.fetch(
+                "SELECT id, name, qty, price, category FROM expenses WHERE project_id=$1 AND LOWER(name) LIKE $2 ORDER BY id DESC LIMIT 25",
+                pid, f"%{word.lower()}%",
+            )
+        if not rows:
+            return await update.message.reply_text(
+                f"По слову «{esc(word)}» ничего не найдено.",
+                parse_mode=ParseMode.HTML,
+            )
+        kb_rows = []
+        for r in rows:
+            qv = Decimal(str(r["qty"]))
+            pv = Decimal(str(r["price"]))
+            s = qv * pv
+            label = f"{r['category']} {r['name']} · {money(s)}"[:60]
+            kb_rows.append([InlineKeyboardButton(label, callback_data=f"exp:edit_pick:{r['id']}")])
+        kb_rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"exp:list:{pid}")])
+        return await update.message.reply_text(
+            f"Найдено: {len(rows)}. Выберите, что редактировать:",
+            reply_markup=InlineKeyboardMarkup(kb_rows),
+        )
+
+    # --- редактирование: 1. Название ---
+    if state == "edit:name":
+        edit = ctx.user_data.get("edit_exp")
+        if not edit:
+            ctx.user_data.pop("state", None)
+            return await update.message.reply_text("Что-то пошло не так.", reply_markup=kb_main())
+        if text:
+            edit["name"] = text.strip()
+        ctx.user_data["edit_exp"] = edit
+        ctx.user_data["state"] = "edit:qty"
+        return await update.message.reply_text(
+            "Шаг 2 из 5 — Количество.\n\n"
+            f"Текущее: <b>{fmt_qty(Decimal(edit['qty']))}</b>\n\n"
+            "Отправьте новое количество или нажмите «⏭ Оставить».\n\n/cancel — отмена.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭ Оставить", callback_data="edit:keep:qty")],
+                [InlineKeyboardButton("❌ Отмена",   callback_data=f"exp:list:{edit['project_id']}")],
+            ]),
+        )
+
+    # --- редактирование: 2. Количество ---
+    if state == "edit:qty":
+        edit = ctx.user_data.get("edit_exp")
+        if not edit:
+            ctx.user_data.pop("state", None)
+            return await update.message.reply_text("Что-то пошло не так.", reply_markup=kb_main())
+        val = parse_number(text)
+        if val is None:
+            return await update.message.reply_text("Нужно число. Например: 1")
+        edit["qty"] = str(val)
+        ctx.user_data["edit_exp"] = edit
+        ctx.user_data["state"] = "edit:price"
+        return await update.message.reply_text(
+            "Шаг 3 из 5 — Цена за единицу.\n\n"
+            f"Текущая: <b>{money(edit['price'])}</b>\n\n"
+            "Отправьте новую цену или нажмите «⏭ Оставить».\n\n/cancel — отмена.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭ Оставить", callback_data="edit:keep:price")],
+                [InlineKeyboardButton("❌ Отмена",   callback_data=f"exp:list:{edit['project_id']}")],
+            ]),
+        )
+
+    # --- редактирование: 3. Цена ---
+    if state == "edit:price":
+        edit = ctx.user_data.get("edit_exp")
+        if not edit:
+            ctx.user_data.pop("state", None)
+            return await update.message.reply_text("Что-то пошло не так.", reply_markup=kb_main())
+        val = parse_money(text)
+        if val is None:
+            return await update.message.reply_text("Нужно число. Например: 850")
+        edit["price"] = str(val)
+        ctx.user_data["edit_exp"] = edit
+        ctx.user_data["state"] = "edit:category"
+        return await update.message.reply_text(
+            "Шаг 4 из 5 — Категория.\n\n"
+            f"Текущая: {esc(edit['category'])}\n\n"
+            "Выберите новую категорию или нажмите «⏭ Оставить».",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏷 Выбрать категорию", callback_data="edit:pick_category")],
+                [InlineKeyboardButton("⏭ Оставить",           callback_data="edit:keep:cat")],
+                [InlineKeyboardButton("❌ Отмена",             callback_data=f"exp:list:{edit['project_id']}")],
+            ]),
+        )
+
+    # --- редактирование: 4. Комментарий ---
+    if state == "edit:comment":
+        edit = ctx.user_data.get("edit_exp")
+        if not edit:
+            ctx.user_data.pop("state", None)
+            return await update.message.reply_text("Что-то пошло не так.", reply_markup=kb_main())
+        edit["comment"] = text.strip() if text.strip() else None
+        ctx.user_data["edit_exp"] = edit
+        return await finish_edit(update, ctx)
+
+    # --- приглашение по username ---
     if state == "invite:username":
         pid = ctx.user_data.get("invite_pid")
         if not pid:
@@ -968,6 +1157,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ {esc(name)} добавлен(а) в проект.", parse_mode=ParseMode.HTML)
         return await send_project_msg(update.message, pid, edit=False, user_id=u.id)
 
+    # --- расход: имя ---
     if state == "exp:name":
         exp = ctx.user_data.get("exp") or {}
         parsed = parse_quick(text)
@@ -1037,6 +1227,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Не понял. /cancel — отмена.", reply_markup=kb_main())
 
+
 async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1044,11 +1235,9 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await upsert_user(u)
 
-    # --- меню ---
     if data == "menu":
         return await q.edit_message_text("Меню:", reply_markup=kb_main())
 
-    # --- списки проектов ---
     if data == "projects:personal":
         text, kb = await projects_list_view(u.id, "personal")
         return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -1057,7 +1246,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, kb = await projects_list_view(u.id, "team")
         return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    # --- создание проекта ---
     if data == "project:new":
         ctx.user_data["state"] = "newp:name"
         ctx.user_data.pop("new_project", None)
@@ -1092,7 +1280,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"✅ Проект «{esc(name)}» создан.\nТип: {type_label}", parse_mode=ParseMode.HTML)
         return await send_project_msg(q.message, pid, edit=False, user_id=u.id)
 
-    # --- открытие проекта ---
     if data.startswith("project:view:"):
         try:
             pid = int(data.split(":")[2])
@@ -1103,7 +1290,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["current_project"] = pid
         return await send_project_msg(q, pid, edit=True, user_id=u.id)
 
-    # --- настройки проекта ---
     if data.startswith("project:settings:"):
         pid = int(data.split(":")[2])
         if not await user_can_view_project(pid, u.id):
@@ -1146,7 +1332,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["budget_pid"] = pid
         return await q.edit_message_text("Отправьте новый бюджет числом (например 150000).\n\n/cancel — отмена.")
 
-    # --- изменить тип ---
     if data.startswith("project:type:"):
         pid = int(data.split(":")[2])
         if not await user_can_edit_project(pid, u.id):
@@ -1175,7 +1360,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"✅ Тип проекта изменён на {label}.")
         return await send_project_msg(q.message, pid, edit=False, user_id=u.id)
 
-    # --- приглашение ---
     if data.startswith("project:invite:"):
         parts = data.split(":")
         if len(parts) == 3:
@@ -1221,7 +1405,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ]),
             )
 
-    # --- удаление проекта ---
     if data.startswith("project:delete:"):
         pid = int(data.split(":")[2])
         if not await user_can_edit_project(pid, u.id):
@@ -1242,7 +1425,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, kb = await projects_list_view(u.id, "team")
         return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    # --- добавить расход ---
     if data.startswith("exp:add:"):
         pid = int(data.split(":")[2])
         if not await user_can_view_project(pid, u.id):
@@ -1256,15 +1438,13 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "• <code>такси 1200</code>\n"
             "• <code>3 банки краски по 850</code>\n"
             "• <code>свет 2 x 500</code>\n\n"
-            "Или отправьте только название — введу по шагам.\n\n"
-            "/cancel — отмена",
+            "Или отправьте только название — введу по шагам.\n\n/cancel — отмена",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Отмена", callback_data=f"exp:cancel:{pid}")],
             ]),
         )
 
-    # --- список расходов ---
     if data.startswith("exp:list:"):
         pid = int(data.split(":")[2])
         if not await user_can_view_project(pid, u.id):
@@ -1300,12 +1480,155 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             text = text[:3900] + "\n\n… (показаны не все)"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Добавить расход", callback_data=f"exp:add:{pid}")],
-            [InlineKeyboardButton("🗑 Удалить расход",  callback_data=f"exp:delete:{pid}")],
+            [InlineKeyboardButton("✏️ Редактировать",   callback_data=f"exp:edit:{pid}"),
+             InlineKeyboardButton("🗑 Удалить расход",  callback_data=f"exp:delete:{pid}")],
             [InlineKeyboardButton("◀️ Назад к проекту", callback_data=f"project:view:{pid}")],
         ])
         return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    # --- удаление расхода ---
+    # --- РЕДАКТИРОВАНИЕ ---
+    if data.startswith("exp:edit:"):
+        pid = int(data.split(":")[2])
+        if not await user_can_view_project(pid, u.id):
+            return await q.edit_message_text("У вас нет доступа к этому проекту.")
+        async with pool.acquire() as c:
+            cnt = await c.fetchval("SELECT COUNT(*) FROM expenses WHERE project_id=$1", pid)
+        if cnt == 0:
+            return await q.edit_message_text(
+                "Расходов нет.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("◀️ К расходам", callback_data=f"exp:list:{pid}")],
+                ]),
+            )
+        if cnt > 25:
+            ctx.user_data["state"] = "edit:search"
+            ctx.user_data["edit_pid"] = pid
+            return await q.edit_message_text(
+                f"В проекте {cnt} расходов. Слишком много для списка.\n\n"
+                "Введите часть названия расхода, который хотите отредактировать.\n"
+                "Например: <code>такси</code>\n\n/cancel — отмена",
+                parse_mode=ParseMode.HTML,
+            )
+        return await show_edit_choices(q, pid, u.id)
+
+    if data.startswith("exp:edit_pick:"):
+        eid = int(data.split(":")[2])
+        async with pool.acquire() as c:
+            e = await c.fetchrow(
+                "SELECT id, project_id, name, qty, price, category, comment FROM expenses WHERE id=$1",
+                eid,
+            )
+        if not e:
+            return await q.edit_message_text("Расход уже удалён.")
+        if not await user_can_view_project(e["project_id"], u.id):
+            return await q.edit_message_text("У вас нет доступа к этому проекту.")
+        ctx.user_data["edit_exp"] = {
+            "id": e["id"],
+            "project_id": e["project_id"],
+            "name": e["name"],
+            "qty": str(e["qty"]),
+            "price": str(e["price"]),
+            "category": e["category"],
+            "comment": e["comment"],
+        }
+        ctx.user_data["state"] = "edit:name"
+        return await q.edit_message_text(
+            f"Редактируем расход «{esc(e['name'])}»\n\n"
+            "Шаг 1 из 5 — Название.\n\n"
+            f"Текущее: <b>{esc(e['name'])}</b>\n\n"
+            "Отправьте новое название или нажмите «⏭ Оставить».\n\n/cancel — отмена.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭ Оставить", callback_data="edit:keep:name")],
+                [InlineKeyboardButton("❌ Отмена",   callback_data=f"exp:list:{e['project_id']}")],
+            ]),
+        )
+
+    if data.startswith("edit:keep:"):
+        what = data.split(":")[2]
+        edit = ctx.user_data.get("edit_exp")
+        if not edit:
+            return await q.edit_message_text("Сессия истекла. Начните заново.")
+        if what == "name":
+            ctx.user_data["state"] = "edit:qty"
+            return await q.edit_message_text(
+                "Шаг 2 из 5 — Количество.\n\n"
+                f"Текущее: <b>{fmt_qty(Decimal(edit['qty']))}</b>\n\n"
+                "Отправьте новое количество или нажмите «⏭ Оставить».",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏭ Оставить", callback_data="edit:keep:qty")],
+                    [InlineKeyboardButton("❌ Отмена",   callback_data=f"exp:list:{edit['project_id']}")],
+                ]),
+            )
+        if what == "qty":
+            ctx.user_data["state"] = "edit:price"
+            return await q.edit_message_text(
+                "Шаг 3 из 5 — Цена за единицу.\n\n"
+                f"Текущая: <b>{money(edit['price'])}</b>\n\n"
+                "Отправьте новую цену или нажмите «⏭ Оставить».",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏭ Оставить", callback_data="edit:keep:price")],
+                    [InlineKeyboardButton("❌ Отмена",   callback_data=f"exp:list:{edit['project_id']}")],
+                ]),
+            )
+        if what == "price":
+            ctx.user_data["state"] = "edit:category"
+            return await q.edit_message_text(
+                "Шаг 4 из 5 — Категория.\n\n"
+                f"Текущая: {esc(edit['category'])}\n\n"
+                "Выберите новую категорию или нажмите «⏭ Оставить».",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🏷 Выбрать категорию", callback_data="edit:pick_category")],
+                    [InlineKeyboardButton("⏭ Оставить",           callback_data="edit:keep:cat")],
+                    [InlineKeyboardButton("❌ Отмена",             callback_data=f"exp:list:{edit['project_id']}")],
+                ]),
+            )
+        if what == "cat":
+            ctx.user_data["state"] = "edit:comment"
+            return await q.edit_message_text(
+                "Шаг 5 из 5 — Комментарий.\n\n"
+                f"Текущий: {esc(edit.get('comment') or '—')}\n\n"
+                "Отправьте новый комментарий или нажмите «⏭ Оставить».",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏭ Оставить", callback_data="edit:keep:comment")],
+                    [InlineKeyboardButton("❌ Отмена",   callback_data=f"exp:list:{edit['project_id']}")],
+                ]),
+            )
+        if what == "comment":
+            return await finish_edit(update, ctx)
+
+    if data == "edit:pick_category":
+        edit = ctx.user_data.get("edit_exp")
+        if not edit:
+            return await q.edit_message_text("Сессия истекла. Начните заново.")
+        rows = [[InlineKeyboardButton(c, callback_data=f"edit:cat:{i}")] for i, c in enumerate(CATEGORIES)]
+        rows.append([InlineKeyboardButton("⏭ Оставить", callback_data="edit:keep:cat")])
+        return await q.edit_message_text("Выберите новую категорию:", reply_markup=InlineKeyboardMarkup(rows))
+
+    if data.startswith("edit:cat:"):
+        idx = int(data.split(":")[2])
+        edit = ctx.user_data.get("edit_exp")
+        if not edit:
+            return await q.edit_message_text("Сессия истекла. Начните заново.")
+        edit["category"] = CATEGORIES[idx]
+        ctx.user_data["edit_exp"] = edit
+        ctx.user_data["state"] = "edit:comment"
+        return await q.edit_message_text(
+            "Шаг 5 из 5 — Комментарий.\n\n"
+            f"Текущий: {esc(edit.get('comment') or '—')}\n\n"
+            "Отправьте новый комментарий или нажмите «⏭ Оставить».",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭ Оставить", callback_data="edit:keep:comment")],
+                [InlineKeyboardButton("❌ Отмена",   callback_data=f"exp:list:{edit['project_id']}")],
+            ]),
+        )
+
+    # --- УДАЛЕНИЕ ---
     if data.startswith("exp:delete:"):
         pid = int(data.split(":")[2])
         if not await user_can_view_project(pid, u.id):
@@ -1363,7 +1686,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, kb = await project_view(pid, user_id=u.id)
         return await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    # --- выбор категории ---
+    # --- выбор категории (новая трата) ---
     if data.startswith("cat:"):
         _, pid_s, idx_s = data.split(":")
         pid = int(pid_s)
@@ -1422,7 +1745,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, kb = await project_view(pid, user_id=u.id)
         return await q.edit_message_text("Отменено.\n\n" + text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    # --- экспорт ---
     if data.startswith("excel:"):
         try:
             pid = int(data.split(":")[1])
