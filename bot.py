@@ -803,8 +803,6 @@ async def finish_edit(update, ctx):
     text, kb = await project_view(pid, user_id=uid)
     return await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-# ---------- Excel (с сводкой) ----------
-
 async def make_excel(update, pid):
     q = update.callback_query
     user_id = update.effective_user.id
@@ -816,7 +814,6 @@ async def make_excel(update, pid):
     if not p:
         return await q.message.reply_text("Проект не найден.")
     rows = _sort_rows_by_category(rows)
-    summary = _category_summary(rows)
     total = sum((Decimal(str(r["qty"])) * Decimal(str(r["price"])) for r in rows), Decimal(0))
     budget = Decimal(str(p["budget"]))
     left = budget - total
@@ -824,7 +821,6 @@ async def make_excel(update, pid):
     wb = Workbook()
     ws = wb.active
     ws.title = "Смета"
-
     ws["A1"] = "СМЕТА"
     ws["A1"].font = Font(bold=True, size=16)
     ws.merge_cells("A1:H1")
@@ -834,34 +830,14 @@ async def make_excel(update, pid):
     ws["A5"] = "Потрачено"; ws["B5"] = float(total)
     ws["A6"] = "Осталось";  ws["B6"] = float(left)
 
-    # --- СВОДКА ПО КАТЕГОРИЯМ ---
-    ws.append([])
-    ws.append(["ИТОГИ ПО КАТЕГОРИЯМ"])
-    ws.cell(row=ws.max_row, column=1).font = Font(bold=True, size=12)
-    summary_header_row = ws.max_row + 1
-    ws.append(["Категория", "Сумма", "Кол-во позиций"])
-    bold = Font(bold=True)
-    fill = PatternFill("solid", fgColor="DDDDDD")
-    for col in range(1, 4):
-        cell = ws.cell(row=summary_header_row, column=col)
-        cell.font = bold
-        cell.fill = fill
-    for cat, cat_total, cat_count in summary:
-        ws.append([cat, float(cat_total), cat_count])
-    ws.append(["ИТОГО", float(total), len(rows)])
-    ws.cell(row=ws.max_row, column=1).font = bold
-    ws.cell(row=ws.max_row, column=2).font = bold
-
-    # --- ДЕТАЛЬНЫЕ РАСХОДЫ ---
-    ws.append([])
-    ws.append([])
-    ws.append(["ДЕТАЛЬНЫЕ РАСХОДЫ"])
-    ws.cell(row=ws.max_row, column=1).font = Font(bold=True, size=12)
-    detail_header_row = ws.max_row + 1
     headers = ["Категория", "Наименование", "Количество", "Цена", "Сумма", "Комментарий", "Кто добавил", "Дата"]
+    ws.append([])
     ws.append(headers)
+    header_row = ws.max_row
+    fill = PatternFill("solid", fgColor="DDDDDD")
+    bold = Font(bold=True)
     for col in range(1, len(headers) + 1):
-        cell = ws.cell(row=detail_header_row + 1, column=col)
+        cell = ws.cell(row=header_row, column=col)
         cell.font = bold
         cell.fill = fill
         cell.alignment = Alignment(horizontal="center")
@@ -888,7 +864,7 @@ async def make_excel(update, pid):
 
 # ---------- PDF (с сводкой) ----------
 
-async def make_pdf(update, pid):
+async def make_excel(update, pid):
     q = update.callback_query
     user_id = update.effective_user.id
     if not await user_can_view_project(pid, user_id):
@@ -899,31 +875,52 @@ async def make_pdf(update, pid):
     if not p:
         return await q.message.reply_text("Проект не найден.")
     rows = _sort_rows_by_category(rows)
-    summary = _category_summary(rows)
     total = sum((Decimal(str(r["qty"])) * Decimal(str(r["price"])) for r in rows), Decimal(0))
     budget = Decimal(str(p["budget"]))
     left = budget - total
-    FONT, FONT_BOLD = _register_cyrillic_fonts()
 
-    out = io.BytesIO()
-    doc = SimpleDocTemplate(out, pagesize=A4, leftMargin=30, rightMargin=30, topMargin=30, bottomMargin=30)
-    title_style   = ParagraphStyle("T",    fontName=FONT_BOLD, fontSize=22, leading=26, alignment=1)
-    h2_style      = ParagraphStyle("H2",   fontName=FONT_BOLD, fontSize=14, leading=18, spaceAfter=6)
-    section_style = ParagraphStyle("SEC",  fontName=FONT_BOLD, fontSize=12, leading=16, spaceBefore=10, spaceAfter=6)
-    body_style    = ParagraphStyle("B",    fontName=FONT,      fontSize=11, leading=15)
-    type_label = "Личный" if p["is_personal"] else "Командный"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Смета"
+    ws["A1"] = "СМЕТА"
+    ws["A1"].font = Font(bold=True, size=16)
+    ws.merge_cells("A1:H1")
+    ws["A2"] = "Проект";    ws["B2"] = p["name"]
+    ws["A3"] = "Тип";       ws["B3"] = "Личный" if p["is_personal"] else "Командный"
+    ws["A4"] = "Бюджет";    ws["B4"] = float(budget)
+    ws["A5"] = "Потрачено"; ws["B5"] = float(total)
+    ws["A6"] = "Осталось";  ws["B6"] = float(left)
 
-    story = [
-        Paragraph("СМЕТА", title_style),
-        Paragraph(esc(p["name"]), h2_style),
-        Paragraph(f"Тип: {type_label}", body_style),
-        Spacer(1, 6),
-        Paragraph(f"Бюджет: {money(budget)}", body_style),
-        Paragraph(f"Потрачено: {money(total)}", body_style),
-        Paragraph(f"Осталось: {money(left)}", body_style),
-        Spacer(1, 12),
-    ]
+    headers = ["Категория", "Наименование", "Количество", "Цена", "Сумма", "Комментарий", "Кто добавил", "Дата"]
+    ws.append([])
+    ws.append(headers)
+    header_row = ws.max_row
+    fill = PatternFill("solid", fgColor="DDDDDD")
+    bold = Font(bold=True)
+    for col in range(1, len(headers) + 1):
+        cell = ws.cell(row=header_row, column=col)
+        cell.font = bold
+        cell.fill = fill
+        cell.alignment = Alignment(horizontal="center")
 
+    for r in rows:
+        qv = Decimal(str(r["qty"]))
+        pv = Decimal(str(r["price"]))
+        s = qv * pv
+        dt = r["created_at"].strftime("%d.%m.%Y %H:%M") if r["created_at"] else ""
+        author = ("@" + r["author_username"]) if r["author_username"] else (f"id{r['author_id']}" if r["author_id"] else "")
+        ws.append([r["category"], r["name"], float(qv), float(pv), float(s), r["comment"] or "", author, dt])
+
+    total_row = ws.max_row + 1
+    ws.cell(row=total_row, column=4, value="ИТОГО").font = bold
+    ws.cell(row=total_row, column=5, value=float(total)).font = bold
+    for i, w in enumerate([22, 28, 12, 12, 14, 30, 18, 18], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    await q.message.reply_document(buf, filename=f"smeta_{_safe_name(p['name'])}.xlsx")
     # --- СВОДКА ПО КАТЕГОРИЯМ ---
     if summary:
         story.append(Paragraph("Итоги по категориям", section_style))
