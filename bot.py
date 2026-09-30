@@ -319,6 +319,10 @@ async def check_yookassa_payment(user_id, payment_id):
         payment = Payment.find_one(payment_id)
 
         if payment.status == "succeeded":
+            # Определяем срок по сумме
+            amount = float(payment.amount.value)
+            days = 90 if amount >= 1300 else 30
+
             async with pool.acquire() as c:
                 await c.execute(
                     "UPDATE payments SET status='succeeded' WHERE payment_id=$1",
@@ -327,16 +331,16 @@ async def check_yookassa_payment(user_id, payment_id):
                 await c.execute(
                     """
                     INSERT INTO subscriptions(user_id, expires_at, updated_at)
-                    VALUES($1, NOW() + INTERVAL '30 days', NOW())
+                    VALUES($1, NOW() + ($2 || ' days')::interval, NOW())
                     ON CONFLICT (user_id) DO UPDATE
-                    SET expires_at = GREATEST(subscriptions.expires_at, NOW()) + INTERVAL '30 days',
+                    SET expires_at = GREATEST(subscriptions.expires_at, NOW()) + ($2 || ' days')::interval,
                         notified_3days = FALSE,
                         notified_expired = FALSE,
                         updated_at = NOW()
                     """,
-                    user_id,
+                    user_id, str(days),
                 )
-            return True, "Оплата прошла! Доступ активирован на 30 дней."
+            return True, f"Оплата прошла! Доступ активирован на {days} дней."
         else:
             return False, f"Статус платежа: {payment.status}. Попробуйте позже."
     except Exception as e:
@@ -907,7 +911,7 @@ async def check_access_or_paywall(update, ctx, u):
             return True
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💎 Купить доступ — 500 ₽", callback_data="buy:pay")],
+        [InlineKeyboardButton("💎 Оформить подписку", callback_data="buy:access")],
     ])
     text = (
         "🔒 <b>Доступ к боту по подписке</b>\n\n"
@@ -1220,7 +1224,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await upsert_user(u)
 
-    if data not in ("buy:access", "buy:pay", "buy:check"):
+    if not (data.startswith("buy:") or data == "menu"):
         if not await check_access_or_paywall(update, ctx, u):
             return
 
@@ -1598,19 +1602,25 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except (IndexError, ValueError):
             return await q.edit_message_text("Ошибка: не понял, какой проект.")
         return await make_pdf(update, pid)
-    if data == "buy:access":
+       if data == "buy:access":
         is_active, expires = await get_subscription_info(u.id)
+        header = ""
         if is_active:
             exp_str = expires.strftime("%d.%m.%Y") if expires else "—"
-            return await q.edit_message_text(
-                f"✅ <b>Ваша подписка активна</b>\n\n"
-                f"Действует до: <b>{exp_str}</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Продлить на 30 дней — 500 ₽", callback_data="buy:pay")],
-                    [InlineKeyboardButton("◀️ Назад", callback_data="menu")],
-                ]),
-            )
+            header = f"✅ <b>Ваша подписка активна</b>\nДействует до: <b>{exp_str}</b>\n\n"
+
+        return await q.edit_message_text(
+            header +
+            "💎 <b>Подписка на бота</b>\n\n"
+            "Выберите тариф:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📅 30 дней — 500 ₽",      callback_data="buy:pay:30")],
+                [InlineKeyboardButton("🔥 90 дней — 1300 ₽ (выгодно)", callback_data="buy:pay:90")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="menu")],
+            ]),
+        )
+
         return await q.edit_message_text(
             "💎 <b>Подписка на бота</b>\n\n"
             "Оформите подписку на 30 дней за <b>500 ₽</b>, "
@@ -1622,9 +1632,14 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]),
         )
 
-    if data == "buy:pay":
+        if data.startswith("buy:pay"):
+        parts = data.split(":")
+        days = int(parts[2]) if len(parts) > 2 else 30
+        amount = 500 if days == 30 else 1300
         await q.edit_message_text("⏳ Создаю платёж...")
-        link, err = await create_yookassa_payment(u.id, 500)
+        link, err = await create_yookassa_payment(
+            u.id, amount, description=f"Подписка на {days} дней"
+        )
         if not link:
             return await q.edit_message_text(
                 f"❌ {err}",
@@ -1633,7 +1648,8 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ]),
             )
         return await q.edit_message_text(
-            "💎 <b>Оплата доступа</b>\n\n"
+            f"💎 <b>Оплата подписки на {days} дней</b>\n\n"
+            f"Сумма: <b>{money(amount)}</b>\n\n"
             "Нажмите кнопку ниже, чтобы перейти к оплате.\n"
             "После оплаты вернитесь и нажмите «Я оплатил».",
             parse_mode=ParseMode.HTML,
@@ -1643,6 +1659,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("◀️ Назад", callback_data="menu")],
             ]),
         )
+
 
     if data == "buy:check":
         async with pool.acquire() as c:
