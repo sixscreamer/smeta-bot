@@ -183,6 +183,32 @@ async def init_db():
 
 
 # ---------- ЮKassa ----------
+async def create_yookassa_payment(user_id, amount, description="Доступ к боту"):
+    if not Configuration.account_id or not Configuration.secret_key:
+        return None, "Платежи временно недоступны."
+
+    try:
+        payment = Payment.create({
+            "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
+            "confirmation": {
+                "type": "redirect",
+                "return_url": YOOKASSA_RETURN_URL,
+            },
+            "capture": True,
+            "description": description,
+            "metadata": {"user_id": str(user_id)},
+        }, str(user_id) + str(amount))
+
+        async with pool.acquire() as c:
+            await c.execute(
+                "INSERT INTO payments(user_id, payment_id, amount, status) VALUES($1,$2,$3,$4)",
+                user_id, payment.id, amount, payment.status,
+            )
+
+        return payment.confirmation.confirmation_url, None
+    except Exception as e:
+        log.error("YooKassa create payment failed: %s", e)
+        return None, "Не удалось создать платёж. Попробуйте позже."
 async def check_yookassa_payment(user_id, payment_id):
     if not Configuration.account_id or not Configuration.secret_key:
         return False, "Платежи недоступны."
