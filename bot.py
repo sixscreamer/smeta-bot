@@ -32,9 +32,8 @@ from reportlab.platypus import (
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from yookassa import Configuration, Payment
 
-from async_yookassa import YooKassaClient
-from async_yookassa.models.payment import PaymentRequest, Amount, RedirectConfirmationRequest
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
