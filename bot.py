@@ -140,6 +140,11 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     expires_at    TIMESTAMPTZ NOT NULL,
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS trial_used (
+    user_id     BIGINT PRIMARY KEY,
+    used_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
 
@@ -243,14 +248,54 @@ async def check_yookassa_payment(user_id, payment_id):
 
 
 
-
 async def user_has_subscription(user_id):
-    """Проверяет, активна ли подписка."""
+    """Возвращает True, если у пользователя активная подписка ИЛИ триал."""
     async with pool.acquire() as c:
-        row = await c.fetchrow(
+        sub = await c.fetchrow(
             "SELECT expires_at FROM subscriptions WHERE user_id=$1 AND expires_at > NOW()",
             user_id,
         )
+        if sub:
+            return True, sub["expires_at"], "subscription"
+
+        trial = await c.fetchrow(
+            "SELECT used_at FROM trial_used WHERE user_id=$1", user_id
+        )
+        if trial:
+            return False, None, "expired"
+        else:
+            await c.execute(
+                "INSERT INTO trial_used(user_id, used_at) VALUES($1, NOW())",
+                user_id,
+            )
+            await c.execute(
+                """
+                INSERT INTO subscriptions(user_id, expires_at, updated_at)
+                VALUES($1, NOW() + INTERVAL '3 days', NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET expires_at = NOW() + INTERVAL '3 days',
+                    updated_at = NOW()
+                """,
+                user_id,
+            )
+            return True, None, "trial"
+
+
+async def get_subscription_info(user_id):
+    """Возвращает (is_active, expires_at, kind).
+    kind: 'trial' | 'subscription' | 'expired'."""
+    async with pool.acquire() as c:
+        sub = await c.fetchrow(
+            "SELECT expires_at FROM subscriptions WHERE user_id=$1 AND expires_at > NOW()",
+            user_id,
+        )
+        if sub:
+            trial_used = await c.fetchrow(
+                "SELECT 1 FROM trial_used WHERE user_id=$1", user_id
+            )
+            kind = "trial" if trial_used else "subscription"
+            return True, sub["expires_at"], kind
+        return False, None, "expired"
     return row is not None
 async def upsert_user(u):
     if u is None:
@@ -957,11 +1002,38 @@ async def make_pdf(update, pid):
 
 
 # ---------- Команды ----------
+async def check_access_or_paywall(update, ctx, u):
+    """
+    Проверяет доступ. Если активен — возвращает True.
+    Если нет — показывает paywall (кнопку оплаты) и возвращает False.
+    """
+    is_active, expires, kind = await get_subscription_info(u.id)
+    if is_active:
+        return True
 
+    # Доступа нет — показываем paywall
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 Купить доступ — 500 ₽", callback_data="buy:pay")],
+    ])
+    text = (
+        "🔒 <b>Доступ закончился</b>\n\n"
+        "Оформите подписку на 30 дней за <b>500 ₽</b>, "
+        "чтобы продолжить пользоваться ботом."
+    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=kb
+        )
+    else:
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=kb
+        )
+    return False
 async def cmd_start(update, ctx):
     u = update.effective_user
-  
     await upsert_user(u)
+    if not await check_access_or_paywall(update, ctx, u):
+        return
     args = ctx.args or []
     if args and args[0].startswith("join_"):
         return await handle_join_link(update, ctx, args[0][5:])
@@ -1015,8 +1087,9 @@ async def cmd_cancel(update, ctx):
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-  
     await upsert_user(u)
+    if not await check_access_or_paywall(update, ctx, u):
+        return
     state = ctx.user_data.get("state")
     text = (update.message.text or "").strip()
 
@@ -1345,8 +1418,12 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data or ""
     u = update.effective_user
-   
     await upsert_user(u)
+
+    # 💎 Оплата и меню доступны всегда — остальное только с подпиской
+    if data not in ("buy:access", "buy:pay", "buy:check", "menu"):
+        if not await check_access_or_paywall(update, ctx, u):
+            return
 
     if data == "menu":
         return await q.edit_message_text("Меню:", reply_markup=kb_main())
