@@ -166,6 +166,8 @@ async def migrate_db():
         await c.execute("UPDATE projects SET is_personal=FALSE WHERE is_personal IS NULL")
         await c.execute("INSERT INTO project_members(project_id, user_id, role) SELECT id, creator_id, 'owner' FROM projects WHERE creator_id IS NOT NULL ON CONFLICT (project_id, user_id) DO NOTHING")
         await c.execute("INSERT INTO project_members(project_id, user_id, role) SELECT DISTINCT e.project_id, e.author_id, 'member' FROM expenses e WHERE e.author_id IS NOT NULL ON CONFLICT (project_id, user_id) DO NOTHING")
+        await c.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS notified_3days BOOLEAN NOT NULL DEFAULT FALSE")
+        await c.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS notified_expired BOOLEAN NOT NULL DEFAULT FALSE")
     log.info("Migration done")
 
 
@@ -327,6 +329,8 @@ async def check_yookassa_payment(user_id, payment_id):
                     VALUES($1, NOW() + INTERVAL '30 days', NOW())
                     ON CONFLICT (user_id) DO UPDATE
                     SET expires_at = GREATEST(subscriptions.expires_at, NOW()) + INTERVAL '30 days',
+                        notified_3days = FALSE,
+                        notified_expired = FALSE,
                         updated_at = NOW()
                     """,
                     user_id,
@@ -1607,6 +1611,58 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     log.warning("Unhandled callback: %s", data)
 
+async def send_expiry_notifications(app):
+    async with pool.acquire() as c:
+        soon = await c.fetch(
+            "SELECT user_id, expires_at FROM subscriptions "
+            "WHERE expires_at > NOW() AND expires_at < NOW() + INTERVAL '3 days' "
+            "AND notified_3days = FALSE"
+        )
+    for r in soon:
+        try:
+            await app.bot.send_message(
+                r["user_id"],
+                f"⏰ Ваша подписка заканчивается {r['expires_at'].strftime('%d.%m.%Y')}.\n\n"
+                "Продлите, чтобы не потерять доступ — напишите /start",
+            )
+            async with pool.acquire() as c:
+                await c.execute(
+                    "UPDATE subscriptions SET notified_3days=TRUE WHERE user_id=$1",
+                    r["user_id"],
+                )
+        except Exception as e:
+            log.warning("Notify 3days failed for %s: %s", r["user_id"], e)
+
+    async with pool.acquire() as c:
+        expired = await c.fetch(
+            "SELECT user_id FROM subscriptions "
+            "WHERE expires_at < NOW() AND notified_expired = FALSE"
+        )
+    for r in expired:
+        try:
+            await app.bot.send_message(
+                r["user_id"],
+                "🔒 Ваша подписка закончилась.\n\n"
+                "Чтобы продолжить пользоваться ботом — напишите /start",
+            )
+            async with pool.acquire() as c:
+                await c.execute(
+                    "UPDATE subscriptions SET notified_expired=TRUE WHERE user_id=$1",
+                    r["user_id"],
+                )
+        except Exception as e:
+            log.warning("Notify expired failed for %s: %s", r["user_id"], e)
+
+
+async def expiry_notifications_loop(app):
+    await asyncio.sleep(90)
+    while True:
+        try:
+            await send_expiry_notifications(app)
+        except Exception as e:
+            log.error("Notify loop failed: %s", e)
+        await asyncio.sleep(6 * 3600)
+
 
 async def post_init(app):
     global bot_username
@@ -1614,6 +1670,7 @@ async def post_init(app):
     me = await app.bot.get_me()
     bot_username = me.username
     log.info("Bot @%s started", me.username)
+    asyncio.create_task(expiry_notifications_loop(app))
 
 
 def main():
