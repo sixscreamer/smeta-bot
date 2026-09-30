@@ -963,7 +963,7 @@ async def make_pdf(update, pid):
     await q.message.reply_document(out, filename=f"smeta_{_safe_name(p['name'])}.pdf")
 
 
-# ---------- Команды ----------
+# ---------- Команды ----------#
 async def check_access_or_paywall(update, ctx, u):
     """
     Проверяет доступ. Если активен — возвращает True.
