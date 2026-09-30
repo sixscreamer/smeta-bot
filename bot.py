@@ -165,6 +165,7 @@ async def migrate_db():
         await c.execute("UPDATE projects SET is_personal=FALSE WHERE is_personal IS NULL")
         await c.execute("INSERT INTO project_members(project_id, user_id, role) SELECT id, creator_id, 'owner' FROM projects WHERE creator_id IS NOT NULL ON CONFLICT (project_id, user_id) DO NOTHING")
         await c.execute("INSERT INTO project_members(project_id, user_id, role) SELECT DISTINCT e.project_id, e.author_id, 'member' FROM expenses e WHERE e.author_id IS NOT NULL ON CONFLICT (project_id, user_id) DO NOTHING")
+        await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS receipt_file_id TEXT")
     log.info("Migration done")
 
 
@@ -511,6 +512,9 @@ def kb_project(pid, role=None):
             InlineKeyboardButton("📋 Расходы", callback_data=f"exp:list:{pid}"),
             InlineKeyboardButton("📊 Excel",  callback_data=f"excel:{pid}"),
             InlineKeyboardButton("📄 PDF",    callback_data=f"pdf:{pid}"),
+        ],
+        [
+            InlineKeyboardButton("📎 Прикрепить чек", callback_data=f"receipt:choose:{pid}"),
         ],
     ]
     if role == ROLE_OWNER:
