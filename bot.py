@@ -258,34 +258,7 @@ async def user_has_subscription(user_id):
     return sub is not None
 
 
-async def get_subscription_info(user_id):
-    """Возвращает (is_active, expires_at)."""
-    async with pool.acquire() as c:
-        sub = await c.fetchrow(
-            "SELECT expires_at FROM subscriptions WHERE user_id=$1 AND expires_at > NOW()",
-            user_id,
-        )
-    if sub:
-        return True, sub["expires_at"]
-    return False, None
 
-
-async def get_subscription_info(user_id):
-    """Возвращает (is_active, expires_at, kind).
-    kind: 'trial' | 'subscription' | 'expired'."""
-    async with pool.acquire() as c:
-        sub = await c.fetchrow(
-            "SELECT expires_at FROM subscriptions WHERE user_id=$1 AND expires_at > NOW()",
-            user_id,
-        )
-        if sub:
-            trial_used = await c.fetchrow(
-                "SELECT 1 FROM trial_used WHERE user_id=$1", user_id
-            )
-            kind = "trial" if trial_used else "subscription"
-            return True, sub["expires_at"], kind
-        return False, None, "expired"
-    return row is not None
 async def upsert_user(u):
     if u is None:
         return
@@ -996,7 +969,7 @@ async def check_access_or_paywall(update, ctx, u):
     Проверяет доступ. Если активен — возвращает True.
     Если нет — показывает paywall (кнопку оплаты) и возвращает False.
     """
-    is_active, expires, kind = await get_subscription_info(u.id)
+   is_active, expires = await get_subscription_info(u.id)
     if is_active:
         return True
 
