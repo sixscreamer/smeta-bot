@@ -50,9 +50,7 @@ pool = None
 bot_username = None
 
 # Белый список Telegram ID (кому разрешён доступ)
-ALLOWED_USER_IDS = [
-   ,
-]
+ALLOWED_USER_IDS = []
 
 CATEGORIES = [
     "🎬 Аренда",
@@ -978,8 +976,7 @@ async def make_pdf(update, pid):
 
 async def cmd_start(update, ctx):
     u = update.effective_user
-    if u.id not in ALLOWED_USER_IDS:
-        return await update.message.reply_text("Извините, доступ к боту закрыт.")
+  
     await upsert_user(u)
     args = ctx.args or []
     if args and args[0].startswith("join_"):
@@ -1022,8 +1019,7 @@ async def handle_join_link(update, ctx, code):
 
 async def cmd_menu(update, ctx):
     u = update.effective_user
-    if u.id not in ALLOWED_USER_IDS:
-        return await update.message.reply_text("Извините, доступ к боту закрыт.")
+   
     await upsert_user(u)
     await update.message.reply_text("Меню:", reply_markup=kb_main())
 
@@ -1035,8 +1031,7 @@ async def cmd_cancel(update, ctx):
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    if u.id not in ALLOWED_USER_IDS:
-        return
+  
     await upsert_user(u)
     state = ctx.user_data.get("state")
     text = (update.message.text or "").strip()
@@ -1366,8 +1361,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data or ""
     u = update.effective_user
-    if u.id not in ALLOWED_USER_IDS:
-        return
+   
     await upsert_user(u)
 
     if data == "menu":
