@@ -991,7 +991,10 @@ async def cmd_admin(update, ctx):
         "\n".join(lines),
         parse_mode=ParseMode.HTML,
     )
-
+    await update.message.reply_text(
+        "Введите ID для выдачи подписки или /cancel:",
+    )
+    ctx.user_data["state"] = "admin:grant_sub"
 
 async def cmd_cancel(update, ctx):
     for k in ("state", "exp", "new_project", "budget_pid", "invite_pid", "settings_pid"):
@@ -1099,6 +1102,31 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
         return await send_project_msg(update.message, pid, edit=False, user_id=u.id)
+    if state == "admin:grant_sub":
+        if u.id not in ADMIN_IDS:
+            ctx.user_data.pop("state", None)
+            return
+        try:
+            target_id = int(text.strip())
+        except ValueError:
+            return await update.message.reply_text("Нужен числовой ID. Попробуй ещё раз или /cancel.")
+        async with pool.acquire() as c:
+            await c.execute(
+                """
+                INSERT INTO subscriptions(user_id, expires_at, updated_at)
+                VALUES($1, NOW() + INTERVAL '30 days', NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET expires_at = GREATEST(subscriptions.expires_at, NOW()) + INTERVAL '30 days',
+                    notified_3days = FALSE,
+                    notified_expired = FALSE,
+                    updated_at = NOW()
+                """,
+                target_id,
+            )
+        ctx.user_data.pop("state", None)
+        return await update.message.reply_text(
+            f"✅ Подписка выдана пользователю {target_id} на 30 дней."
+        )
 
     if state == "exp:name":
         exp = ctx.user_data.get("exp") or {}
@@ -1682,7 +1710,7 @@ def main():
     )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("admin", ))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
