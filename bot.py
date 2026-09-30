@@ -249,36 +249,25 @@ async def check_yookassa_payment(user_id, payment_id):
 
 
 async def user_has_subscription(user_id):
-    """Возвращает True, если у пользователя активная подписка ИЛИ триал."""
+    """Возвращает True, если есть активная подписка."""
     async with pool.acquire() as c:
         sub = await c.fetchrow(
             "SELECT expires_at FROM subscriptions WHERE user_id=$1 AND expires_at > NOW()",
             user_id,
         )
-        if sub:
-            return True, sub["expires_at"], "subscription"
+    return sub is not None
 
-        trial = await c.fetchrow(
-            "SELECT used_at FROM trial_used WHERE user_id=$1", user_id
+
+async def get_subscription_info(user_id):
+    """Возвращает (is_active, expires_at)."""
+    async with pool.acquire() as c:
+        sub = await c.fetchrow(
+            "SELECT expires_at FROM subscriptions WHERE user_id=$1 AND expires_at > NOW()",
+            user_id,
         )
-        if trial:
-            return False, None, "expired"
-        else:
-            await c.execute(
-                "INSERT INTO trial_used(user_id, used_at) VALUES($1, NOW())",
-                user_id,
-            )
-            await c.execute(
-                """
-                INSERT INTO subscriptions(user_id, expires_at, updated_at)
-                VALUES($1, NOW() + INTERVAL '3 days', NOW())
-                ON CONFLICT (user_id) DO UPDATE
-                SET expires_at = NOW() + INTERVAL '3 days',
-                    updated_at = NOW()
-                """,
-                user_id,
-            )
-            return True, None, "trial"
+    if sub:
+        return True, sub["expires_at"]
+    return False, None
 
 
 async def get_subscription_info(user_id):
