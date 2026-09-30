@@ -515,6 +515,7 @@ def kb_main():
         [InlineKeyboardButton("👤 Личные проекты",   callback_data="projects:personal")],
         [InlineKeyboardButton("👥 Командные проекты", callback_data="projects:team")],
         [InlineKeyboardButton("➕ Новый проект",      callback_data="project:new")],
+        [InlineKeyboardButton("💎 Подписка",          callback_data="buy:access")],
     ])
 
 
