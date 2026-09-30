@@ -183,80 +183,37 @@ async def init_db():
 
 
 # ---------- ЮKassa ----------
-
-async def create_yookassa_payment(user_id, amount, description="Доступ к боту"):
-    """Создаёт платёж и возвращает ссылку на оплату."""
-    if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
-        return None, "Платежи временно недоступны."
-
-    try:
-        async with YooKassaClient(
-            account_id=YOOKASSA_SHOP_ID,
-            secret_key=YOOKASSA_SECRET_KEY,
-        ) as client:
-            request = PaymentRequest(
-                amount=Amount(value=f"{amount:.2f}", currency="RUB"),
-                confirmation=RedirectConfirmationRequest(
-                    type="redirect",
-                    return_url=YOOKASSA_RETURN_URL,
-                ),
-                description=description,
-                capture=True,
-                metadata={"user_id": str(user_id)},
-            )
-            payment = await client.payment.create(request)
-
-            # сохраняем в БД
-            async with pool.acquire() as c:
-                await c.execute(
-                    "INSERT INTO payments(user_id, payment_id, amount, status) "
-                    "VALUES($1,$2,$3,$4)",
-                    user_id, payment.id, amount, payment.status,
-                )
-
-            return payment.confirmation.confirmation_url, None
-    except Exception as e:
-        log.error("YooKassa create payment failed: %s", e)
-        return None, "Не удалось создать платёж. Попробуйте позже."
-
-
 async def check_yookassa_payment(user_id, payment_id):
-    """Проверяет статус платежа и выдаёт подписку на 30 дней, если оплачен."""
-    if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+    if not Configuration.account_id or not Configuration.secret_key:
         return False, "Платежи недоступны."
 
     try:
-        async with YooKassaClient(
-            account_id=YOOKASSA_SHOP_ID,
-            secret_key=YOOKASSA_SECRET_KEY,
-        ) as client:
-            payment = await client.payment.get(payment_id)
+        payment = Payment.find_one(payment_id)
 
-            if payment.status == "succeeded":
-                # обновляем статус в БД
-                async with pool.acquire() as c:
-                    await c.execute(
-                        "UPDATE payments SET status='succeeded' WHERE payment_id=$1",
-                        payment_id,
-                    )
-                    # продлеваем подписку на 30 дней от текущей даты или от конца текущей
-                    await c.execute(
-                        """
-                        INSERT INTO subscriptions(user_id, expires_at, updated_at)
-                        VALUES($1, NOW() + INTERVAL '30 days', NOW())
-                        ON CONFLICT (user_id) DO UPDATE
-                        SET expires_at = GREATEST(subscriptions.expires_at, NOW()) + INTERVAL '30 days',
-                            updated_at = NOW()
-                        """,
-                        user_id,
-                    )
-                return True, "Оплата прошла! Доступ активирован на 30 дней."
-            else:
-                return False, f"Статус платежа: {payment.status}. Попробуйте позже."
-
+        if payment.status == "succeeded":
+            async with pool.acquire() as c:
+                await c.execute(
+                    "UPDATE payments SET status='succeeded' WHERE payment_id=$1",
+                    payment_id,
+                )
+                await c.execute(
+                    """
+                    INSERT INTO subscriptions(user_id, expires_at, updated_at)
+                    VALUES($1, NOW() + INTERVAL '30 days', NOW())
+                    ON CONFLICT (user_id) DO UPDATE
+                    SET expires_at = GREATEST(subscriptions.expires_at, NOW()) + INTERVAL '30 days',
+                        updated_at = NOW()
+                    """,
+                    user_id,
+                )
+            return True, "Оплата прошла! Доступ активирован на 30 дней."
+        else:
+            return False, f"Статус платежа: {payment.status}. Попробуйте позже."
     except Exception as e:
         log.error("YooKassa check payment failed: %s", e)
         return False, "Не удалось проверить платёж."
+
+
 
 
 async def user_has_subscription(user_id):
