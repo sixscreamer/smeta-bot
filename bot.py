@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
-import asyncio
+
 import os
 import io
 import re
@@ -8,6 +8,7 @@ import html
 import logging
 import secrets
 import string
+import asyncio
 from decimal import Decimal, InvalidOperation
 
 import asyncpg
@@ -56,6 +57,10 @@ bot_username = None
 
 ALLOWED_USER_IDS = []
 
+ADMIN_IDS = [
+    778239050,
+]
+
 CATEGORIES = [
     "🎬 Аренда",
     "📍 Локация",
@@ -74,9 +79,6 @@ CATEGORIES = [
 
 CATEGORY_ORDER = {name: i for i, name in enumerate(CATEGORIES)}
 FALLBACK_ORDER = len(CATEGORIES) + 1
-ADMIN_IDS = [
-    778239050,
-]
 
 ROLE_OWNER = "owner"
 ROLE_MEMBER = "member"
@@ -163,11 +165,11 @@ async def migrate_db():
         await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS author_id BIGINT")
         await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS author_username TEXT")
         await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+        await c.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS notified_3days BOOLEAN NOT NULL DEFAULT FALSE")
+        await c.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS notified_expired BOOLEAN NOT NULL DEFAULT FALSE")
         await c.execute("UPDATE projects SET is_personal=FALSE WHERE is_personal IS NULL")
         await c.execute("INSERT INTO project_members(project_id, user_id, role) SELECT id, creator_id, 'owner' FROM projects WHERE creator_id IS NOT NULL ON CONFLICT (project_id, user_id) DO NOTHING")
         await c.execute("INSERT INTO project_members(project_id, user_id, role) SELECT DISTINCT e.project_id, e.author_id, 'member' FROM expenses e WHERE e.author_id IS NOT NULL ON CONFLICT (project_id, user_id) DO NOTHING")
-        await c.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS notified_3days BOOLEAN NOT NULL DEFAULT FALSE")
-        await c.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS notified_expired BOOLEAN NOT NULL DEFAULT FALSE")
     log.info("Migration done")
 
 
@@ -341,6 +343,7 @@ async def check_yookassa_payment(user_id, payment_id):
     except Exception as e:
         log.error("YooKassa check payment failed: %s", e)
         return False, "Не удалось проверить платёж."
+
 
 # ---------- Деньги и форматирование ----------
 
@@ -865,12 +868,43 @@ async def make_pdf(update, pid):
     out.seek(0)
     await q.message.reply_document(out, filename=f"smeta_{_safe_name(p['name'])}.pdf")
 
+
 # ---------- Команды ----------
 
 async def check_access_or_paywall(update, ctx, u):
     is_active, expires = await get_subscription_info(u.id)
     if is_active:
         return True
+
+    async with pool.acquire() as c:
+        trial = await c.fetchrow(
+            "SELECT used_at FROM trial_used WHERE user_id=$1", u.id
+        )
+        if not trial:
+            await c.execute(
+                "INSERT INTO trial_used(user_id, used_at) VALUES($1, NOW())",
+                u.id,
+            )
+            await c.execute(
+                """
+                INSERT INTO subscriptions(user_id, expires_at, updated_at)
+                VALUES($1, NOW() + INTERVAL '1 day', NOW())
+                ON CONFLICT (user_id) DO UPDATE
+                SET expires_at = NOW() + INTERVAL '1 day',
+                    updated_at = NOW()
+                """,
+                u.id,
+            )
+            msg = (
+                "🎁 <b>Пробный период активирован!</b>\n\n"
+                "Вам доступен 1 день бесплатного пользования ботом.\n"
+                "После окончания оформите подписку за 500 ₽ на 30 дней."
+            )
+            if update.callback_query:
+                await update.callback_query.message.reply_text(msg, parse_mode=ParseMode.HTML)
+            else:
+                await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+            return True
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💎 Купить доступ — 500 ₽", callback_data="buy:pay")],
@@ -946,6 +980,7 @@ async def cmd_menu(update, ctx):
         return
     await update.message.reply_text("Меню:", reply_markup=kb_main())
 
+
 async def cmd_admin(update, ctx):
     u = update.effective_user
     if u.id not in ADMIN_IDS:
@@ -991,10 +1026,7 @@ async def cmd_admin(update, ctx):
         "\n".join(lines),
         parse_mode=ParseMode.HTML,
     )
-    await update.message.reply_text(
-        "Введите ID для выдачи подписки или /cancel:",
-    )
-    ctx.user_data["state"] = "admin:grant_sub"
+
 
 async def cmd_cancel(update, ctx):
     for k in ("state", "exp", "new_project", "budget_pid", "invite_pid", "settings_pid"):
@@ -1102,31 +1134,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
         return await send_project_msg(update.message, pid, edit=False, user_id=u.id)
-    if state == "admin:grant_sub":
-        if u.id not in ADMIN_IDS:
-            ctx.user_data.pop("state", None)
-            return
-        try:
-            target_id = int(text.strip())
-        except ValueError:
-            return await update.message.reply_text("Нужен числовой ID. Попробуй ещё раз или /cancel.")
-        async with pool.acquire() as c:
-            await c.execute(
-                """
-                INSERT INTO subscriptions(user_id, expires_at, updated_at)
-                VALUES($1, NOW() + INTERVAL '30 days', NOW())
-                ON CONFLICT (user_id) DO UPDATE
-                SET expires_at = GREATEST(subscriptions.expires_at, NOW()) + INTERVAL '30 days',
-                    notified_3days = FALSE,
-                    notified_expired = FALSE,
-                    updated_at = NOW()
-                """,
-                target_id,
-            )
-        ctx.user_data.pop("state", None)
-        return await update.message.reply_text(
-            f"✅ Подписка выдана пользователю {target_id} на 30 дней."
-        )
 
     if state == "exp:name":
         exp = ctx.user_data.get("exp") or {}
@@ -1213,7 +1220,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await upsert_user(u)
 
-    # Оплата доступна всегда
     if data not in ("buy:pay", "buy:check"):
         if not await check_access_or_paywall(update, ctx, u):
             return
@@ -1638,6 +1644,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     log.warning("Unhandled callback: %s", data)
+
 
 async def send_expiry_notifications(app):
     async with pool.acquire() as c:
