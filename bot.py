@@ -1710,7 +1710,7 @@ def main():
     )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("admin", ))
+    app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
