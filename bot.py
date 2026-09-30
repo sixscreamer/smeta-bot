@@ -154,45 +154,15 @@ CREATE TABLE IF NOT EXISTS trial_used (
 
 async def migrate_db():
     async with pool.acquire() as c:
-        await c.execute(
-            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS is_personal BOOLEAN NOT NULL DEFAULT FALSE"
-        )
-        await c.execute(
-            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
-        )
-        await c.execute(
-            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS comment TEXT"
-        )
-        await c.execute(
-            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS author_id BIGINT"
-        )
-        await c.execute(
-            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS author_username TEXT"
-        )
-        await c.execute(
-            "ALTER TABLE expenses ADD COLUMN IF NOT.author EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
-        )
-        await c.execute(
-            "UPDATE projects SET is_personal=FALSE WHERE is_personal IS NULL"
-        )
-        await c.execute(
-            """
-            INSERT INTO project_members(project_id, user_id, role)
-            SELECT id, creator_id, 'owner'
-            FROM projects
-            WHERE creator_id IS NOT NULL
-            ON CONFLICT (project_id, user_id) DO NOTHING
-            """
-        )
-        await c.execute(
-            """
-            INSERT INTO project_members(project_id, user_id, role)
-            SELECT DISTINCT e.project_id, e.author_id, 'member'
-            FROM expenses e
-            WHERE e_id IS NOT NULL
-            ON CONFLICT (project_id, user_id) DO NOTHING
-            """
-        )
+        await c.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS is_personal BOOLEAN NOT NULL DEFAULT FALSE")
+        await c.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+        await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS comment TEXT")
+        await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS author_id BIGINT")
+        await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS author_username TEXT")
+        await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+        await c.execute("UPDATE projects SET is_personal=FALSE WHERE is_personal IS NULL")
+        await c.execute("INSERT INTO project_members(project_id, user_id, role) SELECT id, creator_id, 'owner' FROM projects WHERE creator_id IS NOT NULL ON CONFLICT (project_id, user_id) DO NOTHING")
+        await c.execute("INSERT INTO project_members(project_id, user_id, role) SELECT DISTINCT e.project_id, e.author_id, 'member' FROM expenses e WHERE e.author_id IS NOT NULL ON CONFLICT (project_id, user_id) DO NOTHING")
     log.info("Migration done")
 
 
