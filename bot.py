@@ -42,9 +42,9 @@ log = logging.getLogger("smeta")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
-YOOKASSA_SHOP_ID = os.environ.get("1481007", "")
-YOOKASSA_SECRET_KEY = os.environ.get("test_7o5ITQKUQZRSgRLYKmiQp1mlEdMEfirT5bWQlitaz9A", "")
-YOOKASSA_RETURN_URL = os.environ.get("https://t.me@smetafashion_bot", "https://t.me")
+YOOKASSA_SHOP_ID = os.environ.get("YOOKASSA_SHOP_ID", "")
+YOOKASSA_SECRET_KEY = os.environ.get("YOOKASSA_SECRET_KEY", "")
+YOOKASSA_RETURN_URL = os.environ.get("YOOKASSA_RETURN_URL", "https://t.me")
 pool = None
 bot_username = None
 
