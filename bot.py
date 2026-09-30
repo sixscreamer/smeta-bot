@@ -1220,7 +1220,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     await upsert_user(u)
 
-    if data not in ("buy:pay", "buy:check"):
+    if data not in ("buy:access", "buy:pay", "buy:check"):
         if not await check_access_or_paywall(update, ctx, u):
             return
 
@@ -1598,6 +1598,29 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except (IndexError, ValueError):
             return await q.edit_message_text("Ошибка: не понял, какой проект.")
         return await make_pdf(update, pid)
+    if data == "buy:access":
+        is_active, expires = await get_subscription_info(u.id)
+        if is_active:
+            exp_str = expires.strftime("%d.%m.%Y") if expires else "—"
+            return await q.edit_message_text(
+                f"✅ <b>Ваша подписка активна</b>\n\n"
+                f"Действует до: <b>{exp_str}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Продлить на 30 дней — 500 ₽", callback_data="buy:pay")],
+                    [InlineKeyboardButton("◀️ Назад", callback_data="menu")],
+                ]),
+            )
+        return await q.edit_message_text(
+            "💎 <b>Подписка на бота</b>\n\n"
+            "Оформите подписку на 30 дней за <b>500 ₽</b>, "
+            "чтобы пользоваться ботом.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Оплатить 500 ₽", callback_data="buy:pay")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="menu")],
+            ]),
+        )
 
     if data == "buy:pay":
         await q.edit_message_text("⏳ Создаю платёж...")
