@@ -74,6 +74,9 @@ CATEGORIES = [
 
 CATEGORY_ORDER = {name: i for i, name in enumerate(CATEGORIES)}
 FALLBACK_ORDER = len(CATEGORIES) + 1
+ADMIN_IDS = [
+    778239050,
+]
 
 ROLE_OWNER = "owner"
 ROLE_MEMBER = "member"
@@ -939,6 +942,52 @@ async def cmd_menu(update, ctx):
         return
     await update.message.reply_text("Меню:", reply_markup=kb_main())
 
+async def cmd_admin(update, ctx):
+    u = update.effective_user
+    if u.id not in ADMIN_IDS:
+        return await update.message.reply_text("⛔ Нет доступа.")
+    await upsert_user(u)
+
+    async with pool.acquire() as c:
+        total_users = await c.fetchval("SELECT COUNT(*) FROM users")
+        paid_users = await c.fetchval(
+            "SELECT COUNT(DISTINCT user_id) FROM payments WHERE status='succeeded'"
+        )
+        active_subs = await c.fetchval(
+            "SELECT COUNT(*) FROM subscriptions WHERE expires_at > NOW()"
+        )
+        total_income = await c.fetchval(
+            "SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='succeeded'"
+        )
+        projects_cnt = await c.fetchval("SELECT COUNT(*) FROM projects")
+        expenses_cnt = await c.fetchval("SELECT COUNT(*) FROM expenses")
+        last_payments = await c.fetch(
+            "SELECT user_id, amount, status, created_at FROM payments "
+            "ORDER BY created_at DESC LIMIT 10"
+        )
+
+    lines = [
+        "👑 <b>Админ-панель</b>\n",
+        f"👥 Пользователей всего: <b>{total_users}</b>",
+        f"💎 Платящих: <b>{paid_users}</b>",
+        f"✅ Активных подписок: <b>{active_subs}</b>",
+        f"💰 Заработано: <b>{money(total_income)}</b>\n",
+        f"📁 Проектов: <b>{projects_cnt}</b>",
+        f"📋 Расходов: <b>{expenses_cnt}</b>\n",
+        "🧾 <b>Последние платежи:</b>",
+    ]
+    for p in last_payments:
+        dt = p["created_at"].strftime("%d.%m %H:%M") if p["created_at"] else ""
+        status_icon = "✅" if p["status"] == "succeeded" else "⏳"
+        lines.append(
+            f"{status_icon} id{p['user_id']} — {money(p['amount'])} ({dt})"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+    )
+
 
 async def cmd_cancel(update, ctx):
     for k in ("state", "exp", "new_project", "budget_pid", "invite_pid", "settings_pid"):
@@ -1576,6 +1625,7 @@ def main():
     )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
