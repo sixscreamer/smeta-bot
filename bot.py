@@ -51,9 +51,7 @@ bot_username = None
 
 # Белый список Telegram ID (кому разрешён доступ)
 ALLOWED_USER_IDS = [
-    778239050,
-    908061079,
-    304434109,
+   ,
 ]
 
 CATEGORIES = [
