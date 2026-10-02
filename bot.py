@@ -1644,10 +1644,30 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 exp["receipt_file_id"],
                 caption=f"📎 Чек: {esc(exp['name'])}",
                 parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Открепить чек", callback_data=f"receipt:detach:{exp_id}")],
+                ]),
             )
         except Exception as e:
             log.error("Send receipt failed: %s", e)
             await q.message.reply_text("Не удалось загрузить фото.")
+        return
+
+    if data.startswith("receipt:detach:"):
+        exp_id = int(data.split(":")[2])
+        async with pool.acquire() as c:
+            exp = await c.fetchrow(
+                "SELECT id, project_id FROM expenses WHERE id=$1", exp_id
+            )
+        if not exp:
+            return await q.edit_message_text("Расход не найден.")
+        if not await user_can_view_project(exp["project_id"], u.id):
+            return await q.edit_message_text("Нет доступа.")
+        async with pool.acquire() as c:
+            await c.execute(
+                "UPDATE expenses SET receipt_file_id=NULL WHERE id=$1", exp_id
+            )
+        await q.edit_message_text("✅ Чек откреплён.")
         return
     if data.startswith("excel:"):
         try:
