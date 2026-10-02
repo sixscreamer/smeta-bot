@@ -10,6 +10,7 @@ import secrets
 import string
 import asyncio
 from decimal import Decimal, InvalidOperation
+from collections import OrderedDict
 
 import asyncpg
 from telegram import (
@@ -257,6 +258,12 @@ def invite_link(code):
     if not bot_username:
         return f"https://t.me/?start=join_{code}"
     return f"https://t.me/{bot_username}?start=join_{code}"
+
+
+def receipt_link(exp_id):
+    if not bot_username:
+        return f"https://t.me/?start=receipt_{exp_id}"
+    return f"https://t.me/{bot_username}?start=receipt_{exp_id}"
 
 
 async def get_subscription_info(user_id):
@@ -762,11 +769,14 @@ async def make_excel(update, pid):
         author = ("@" + r["author_username"]) if r["author_username"] else (
             f"id{r['author_id']}" if r["author_id"] else ""
         )
-        receipt_mark = "📎 Есть чек" if r.get("receipt_file_id") else ""
         ws.append([
             r["category"], r["name"], float(qv), float(pv), float(s),
-            r["comment"] or "", author, dt, receipt_mark,
+            r["comment"] or "", author, dt, "",
         ])
+        if r.get("receipt_file_id"):
+            cell = ws.cell(row=ws.max_row, column=9, value="📎 Чек")
+            cell.hyperlink = receipt_link(r["id"])
+            cell.font = Font(color="0563C1", underline="single")
     total_row = ws.max_row + 1
     ws.cell(row=total_row, column=4, value="ИТОГО").font = bold
     ws.cell(row=total_row, column=5, value=float(total)).font = bold
@@ -817,8 +827,6 @@ async def make_pdf(update, pid):
     ]
     def P(t, st=None):
         return Paragraph(esc(t), st or small_style)
-    # Группируем по категориям
-    from collections import OrderedDict
     groups = OrderedDict()
     for r in rows:
         groups.setdefault(r["category"], []).append(r)
@@ -843,13 +851,17 @@ async def make_pdf(update, pid):
             pv = Decimal(str(r["price"]))
             s = qv * pv
             cat_total += s
-            receipt_mark = "📎" if r.get("receipt_file_id") else ""
+            if r.get("receipt_file_id"):
+                link = receipt_link(r["id"])
+                receipt_cell = Paragraph(f'<link href="{link}"><u>📎 Чек</u></link>', small_style)
+            else:
+                receipt_cell = Paragraph("", small_style)
             data.append([
                 P(r["name"]),
                 P(fmt_qty(qv)),
                 P(money(pv)),
                 P(money(s)),
-                P(receipt_mark),
+                receipt_cell,
             ])
         subtotal_rows.append(len(data))
         data.append([
@@ -859,7 +871,6 @@ async def make_pdf(update, pid):
             Paragraph(f"<b>{money(cat_total)}</b>", small_bold),
             "",
         ])
-    # Общий итог
     data.append([
         Paragraph("<b>ВСЕГО:</b>", cat_style),
         "",
@@ -867,11 +878,11 @@ async def make_pdf(update, pid):
         Paragraph(f"<b>{money(total)}</b>", cat_style),
         "",
     ])
-    table = Table(data, repeatRows=1, colWidths=[260, 55, 75, 85, 30])
+    table = Table(data, repeatRows=1, colWidths=[250, 55, 75, 85, 60])
     style_cmds = [
         ("GRID", (0, 0), (-1, -1), .4, colors.grey),
         ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-        ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+        ("ALIGN", (1, 1), (3, -1), "RIGHT"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]
     for idx in cat_header_rows:
@@ -879,9 +890,10 @@ async def make_pdf(update, pid):
         style_cmds.append(("SPAN", (0, idx), (-1, idx)))
     for idx in subtotal_rows:
         style_cmds.append(("BACKGROUND", (0, idx), (-1, idx), colors.Color(0.97, 0.97, 0.92)))
-    # Общая итоговая строка
+        style_cmds.append(("SPAN", (0, idx), (2, idx)))
     last = len(data) - 1
     style_cmds.append(("BACKGROUND", (0, last), (-1, last), colors.Color(0.88, 0.88, 0.88)))
+    style_cmds.append(("SPAN", (0, last), (2, last)))
     table.setStyle(TableStyle(style_cmds))
     story.append(table)
     doc.build(story)
@@ -919,6 +931,8 @@ async def cmd_start(update, ctx):
     args = ctx.args or []
     if args and args[0].startswith("join_"):
         return await handle_join_link(update, ctx, args[0][5:])
+    if args and args[0].startswith("receipt_"):
+        return await handle_receipt_link(update, ctx, args[0][8:])
     text = (
         f"👋 Привет, {esc(u.first_name or 'друг')}!\n\n"
         "Это бот для командной работы со сметами.\n"
@@ -957,6 +971,32 @@ async def handle_join_link(update, ctx, code):
         parse_mode=ParseMode.HTML,
     )
     return await send_project_msg(update.message, pid, edit=False, user_id=u.id)
+
+
+async def handle_receipt_link(update, ctx, exp_id_str):
+    u = update.effective_user
+    try:
+        exp_id = int(exp_id_str)
+    except ValueError:
+        return await update.message.reply_text("Некорректная ссылка.")
+    async with pool.acquire() as c:
+        exp = await c.fetchrow(
+            "SELECT id, project_id, name, receipt_file_id FROM expenses WHERE id=$1",
+            exp_id,
+        )
+    if not exp or not exp["receipt_file_id"]:
+        return await update.message.reply_text("Чек не найден.")
+    if not await user_can_view_project(exp["project_id"], u.id):
+        return await update.message.reply_text("Нет доступа к этому проекту.")
+    try:
+        await update.message.reply_photo(
+            exp["receipt_file_id"],
+            caption=f"📎 Чек: {esc(exp['name'])}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        log.error("Send receipt failed: %s", e)
+        await update.message.reply_text("Не удалось загрузить фото.")
 
 
 async def cmd_menu(update, ctx):
@@ -1652,7 +1692,6 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log.error("Send receipt failed: %s", e)
             await q.message.reply_text("Не удалось загрузить фото.")
         return
-
     if data.startswith("receipt:detach:"):
         exp_id = int(data.split(":")[2])
         async with pool.acquire() as c:
