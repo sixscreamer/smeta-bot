@@ -1019,7 +1019,7 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if r["comment"]:
                     block.append(f"💬 {esc(r['comment'])}")
                 if r["receipt_url"]:
-                    block.append(f'📎 <a href="{r["receipt_url"]}">Чек (открыть в браузере)</a>')
+                    block.append("📎 Чек прикреплён (открой через кнопку ниже)")
                 block.append(f"👤 {esc(author)} · {dt}")
                 blocks.append("\n".join(block))
             body = "\n\n".join(blocks)
