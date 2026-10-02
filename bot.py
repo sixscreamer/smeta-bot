@@ -13,6 +13,7 @@ from decimal import Decimal, InvalidOperation
 from collections import OrderedDict
 
 import asyncpg
+import httpx
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
 )
@@ -267,9 +268,9 @@ def receipt_link(exp_id):
         return f"https://t.me/?start=receipt_{exp_id}"
     return f"https://t.me/{bot_username}?start=receipt_{exp_id}"
 
+
 async def upload_to_telegraph(image_bytes, filename="receipt.jpg"):
     try:
-        import httpx
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 "https://telegra.ph/upload",
@@ -792,14 +793,14 @@ async def make_excel(update, pid):
             r["category"], r["name"], float(qv), float(pv), float(s),
             r["comment"] or "", author, dt, "",
         ])
-    if r.get("receipt_url"):
+        if r.get("receipt_url"):
             cell = ws.cell(row=ws.max_row, column=9, value="📎 Чек")
             cell.hyperlink = r["receipt_url"]
             cell.font = Font(color="0563C1", underline="single")
         elif r.get("receipt_file_id"):
             cell = ws.cell(row=ws.max_row, column=9, value="📎 Чек")
             cell.hyperlink = receipt_link(r["id"])
-            cell.font = Font(color="0563C1", underline="single")    
+            cell.font = Font(color="0563C1", underline="single")
     total_row = ws.max_row + 1
     ws.cell(row=total_row, column=4, value="ИТОГО").font = bold
     ws.cell(row=total_row, column=5, value=float(total)).font = bold
@@ -874,7 +875,10 @@ async def make_pdf(update, pid):
             pv = Decimal(str(r["price"]))
             s = qv * pv
             cat_total += s
-            if r.get("receipt_file_id"):
+            if r.get("receipt_url"):
+                link = r["receipt_url"]
+                receipt_cell = Paragraph(f'<link href="{link}"><u>📎 Чек</u></link>', small_style)
+            elif r.get("receipt_file_id"):
                 link = receipt_link(r["id"])
                 receipt_cell = Paragraph(f'<link href="{link}"><u>📎 Чек</u></link>', small_style)
             else:
@@ -901,7 +905,7 @@ async def make_pdf(update, pid):
         Paragraph(f"<b>{money(total)}</b>", cat_style),
         "",
     ])
-    table = Table(data, repeatRows=1, colWidths=[250, 55, 75, 85, 60])
+    table = Table(data, repeatRows=1, colWidths=[240, 55, 75, 85, 70])
     style_cmds = [
         ("GRID", (0, 0), (-1, -1), .4, colors.grey),
         ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
@@ -1004,13 +1008,24 @@ async def handle_receipt_link(update, ctx, exp_id_str):
         return await update.message.reply_text("Некорректная ссылка.")
     async with pool.acquire() as c:
         exp = await c.fetchrow(
-            "SELECT id, project_id, name, receipt_file_id FROM expenses WHERE id=$1",
+            "SELECT id, project_id, name, receipt_file_id, receipt_url FROM expenses WHERE id=$1",
             exp_id,
         )
-    if not exp or not exp["receipt_file_id"]:
+    if not exp:
         return await update.message.reply_text("Чек не найден.")
     if not await user_can_view_project(exp["project_id"], u.id):
         return await update.message.reply_text("Нет доступа к этому проекту.")
+    if exp["receipt_url"]:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        return await update.message.reply_text(
+            f"📎 Чек: {esc(exp['name'])}\n\nСсылка откроется в браузере:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🌐 Открыть чек", url=exp["receipt_url"])],
+            ]),
+        )
+    if not exp["receipt_file_id"]:
+        return await update.message.reply_text("Чек не найден.")
     try:
         await update.message.reply_photo(
             exp["receipt_file_id"],
@@ -1096,8 +1111,6 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Что-то пошло не так. Начните заново.")
     photo = update.message.photo[-1]
     file_id = photo.file_id
-
-    # Скачиваем файл из Telegram
     receipt_url = None
     try:
         telegram_file = await photo.get_file()
@@ -1105,7 +1118,6 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         receipt_url = await upload_to_telegraph(bytes(file_bytes))
     except Exception as e:
         log.error("Download/upload receipt failed: %s", e)
-
     async with pool.acquire() as c:
         await c.execute(
             "UPDATE expenses SET receipt_file_id=$1, receipt_url=$2 WHERE id=$3",
@@ -1114,7 +1126,10 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("state", None)
     ctx.user_data.pop("receipt_exp_id", None)
     ctx.user_data.pop("receipt_pid", None)
-    await update.message.reply_text("✅ Чек прикреплён.")
+    if receipt_url:
+        await update.message.reply_text("✅ Чек прикреплён и доступен в браузере.")
+    else:
+        await update.message.reply_text("✅ Чек прикреплён (но не удалось загрузить в браузер).")
     return await send_project_msg(update.message, pid, edit=False, user_id=u.id)
 
 
@@ -1705,25 +1720,39 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         exp_id = int(data.split(":")[2])
         async with pool.acquire() as c:
             exp = await c.fetchrow(
-                "SELECT id, project_id, name, receipt_file_id FROM expenses WHERE id=$1",
+                "SELECT id, project_id, name, receipt_file_id, receipt_url FROM expenses WHERE id=$1",
                 exp_id,
             )
-        if not exp or not exp["receipt_file_id"]:
+        if not exp or (not exp["receipt_file_id"] and not exp["receipt_url"]):
             return await q.edit_message_text("Чек не найден.")
         if not await user_can_view_project(exp["project_id"], u.id):
             return await q.edit_message_text("Нет доступа.")
-        try:
-            await q.message.reply_photo(
-                exp["receipt_file_id"],
-                caption=f"📎 Чек: {esc(exp['name'])}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("❌ Открепить чек", callback_data=f"receipt:detach:{exp_id}")],
-                ]),
-            )
-        except Exception as e:
-            log.error("Send receipt failed: %s", e)
-            await q.message.reply_text("Не удалось загрузить фото.")
+        if exp["receipt_url"]:
+            try:
+                await q.message.reply_text(
+                    f"📎 Чек: {esc(exp['name'])}\n\nСсылка откроется в браузере:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🌐 Открыть чек", url=exp["receipt_url"])],
+                        [InlineKeyboardButton("❌ Открепить чек", callback_data=f"receipt:detach:{exp_id}")],
+                    ]),
+                )
+            except Exception as e:
+                log.error("Send receipt link failed: %s", e)
+                await q.message.reply_text("Не удалось отправить.")
+        else:
+            try:
+                await q.message.reply_photo(
+                    exp["receipt_file_id"],
+                    caption=f"📎 Чек: {esc(exp['name'])}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Открепить чек", callback_data=f"receipt:detach:{exp_id}")],
+                    ]),
+                )
+            except Exception as e:
+                log.error("Send receipt failed: %s", e)
+                await q.message.reply_text("Не удалось загрузить фото.")
         return
     if data.startswith("receipt:detach:"):
         exp_id = int(data.split(":")[2])
@@ -1737,7 +1766,8 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await q.edit_message_text("Нет доступа.")
         async with pool.acquire() as c:
             await c.execute(
-                "UPDATE expenses SET receipt_file_id=NULL WHERE id=$1", exp_id
+                "UPDATE expenses SET receipt_file_id=NULL, receipt_url=NULL WHERE id=$1",
+                exp_id,
             )
         await q.edit_message_text("✅ Чек откреплён.")
         return
