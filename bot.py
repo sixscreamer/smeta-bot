@@ -128,6 +128,7 @@ CREATE TABLE IF NOT EXISTS expenses (
     author_id        BIGINT,
     author_username  TEXT,
     receipt_file_id  TEXT,
+    receipt_url      TEXT,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -163,6 +164,7 @@ async def migrate_db():
         await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS author_username TEXT")
         await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
         await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS receipt_file_id TEXT")
+        await c.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS receipt_url TEXT")
         await c.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS notified_3days BOOLEAN NOT NULL DEFAULT FALSE")
         await c.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS notified_expired BOOLEAN NOT NULL DEFAULT FALSE")
         await c.execute("UPDATE projects SET is_personal=FALSE WHERE is_personal IS NULL")
@@ -264,6 +266,23 @@ def receipt_link(exp_id):
     if not bot_username:
         return f"https://t.me/?start=receipt_{exp_id}"
     return f"https://t.me/{bot_username}?start=receipt_{exp_id}"
+
+async def upload_to_telegraph(image_bytes, filename="receipt.jpg"):
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://telegra.ph/upload",
+                files={"file": (filename, image_bytes, "image/jpeg")},
+            )
+            data = r.json()
+            if isinstance(data, list) and data and "src" in data[0]:
+                return "https://telegra.ph" + data[0]["src"]
+            log.error("Telegraph upload unexpected response: %s", data)
+            return None
+    except Exception as e:
+        log.error("Telegraph upload failed: %s", e)
+        return None
 
 
 async def get_subscription_info(user_id):
@@ -773,10 +792,14 @@ async def make_excel(update, pid):
             r["category"], r["name"], float(qv), float(pv), float(s),
             r["comment"] or "", author, dt, "",
         ])
-        if r.get("receipt_file_id"):
+    if r.get("receipt_url"):
+            cell = ws.cell(row=ws.max_row, column=9, value="📎 Чек")
+            cell.hyperlink = r["receipt_url"]
+            cell.font = Font(color="0563C1", underline="single")
+        elif r.get("receipt_file_id"):
             cell = ws.cell(row=ws.max_row, column=9, value="📎 Чек")
             cell.hyperlink = receipt_link(r["id"])
-            cell.font = Font(color="0563C1", underline="single")
+            cell.font = Font(color="0563C1", underline="single")    
     total_row = ws.max_row + 1
     ws.cell(row=total_row, column=4, value="ИТОГО").font = bold
     ws.cell(row=total_row, column=5, value=float(total)).font = bold
@@ -1073,10 +1096,20 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Что-то пошло не так. Начните заново.")
     photo = update.message.photo[-1]
     file_id = photo.file_id
+
+    # Скачиваем файл из Telegram
+    receipt_url = None
+    try:
+        telegram_file = await photo.get_file()
+        file_bytes = await telegram_file.download_as_bytearray()
+        receipt_url = await upload_to_telegraph(bytes(file_bytes))
+    except Exception as e:
+        log.error("Download/upload receipt failed: %s", e)
+
     async with pool.acquire() as c:
         await c.execute(
-            "UPDATE expenses SET receipt_file_id=$1 WHERE id=$2",
-            file_id, exp_id,
+            "UPDATE expenses SET receipt_file_id=$1, receipt_url=$2 WHERE id=$3",
+            file_id, receipt_url, exp_id,
         )
     ctx.user_data.pop("state", None)
     ctx.user_data.pop("receipt_exp_id", None)
