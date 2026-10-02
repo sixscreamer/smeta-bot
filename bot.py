@@ -803,6 +803,7 @@ async def make_pdf(update, pid):
     body_style  = ParagraphStyle("B",  fontName=FONT,      fontSize=11, leading=15)
     small_style = ParagraphStyle("S",  fontName=FONT,      fontSize=8,  leading=10)
     small_bold  = ParagraphStyle("SB", fontName=FONT_BOLD, fontSize=8,  leading=10)
+    cat_style   = ParagraphStyle("C",  fontName=FONT_BOLD, fontSize=10, leading=13)
     type_label = "Личный" if p["is_personal"] else "Командный"
     story = [
         Paragraph("СМЕТА", title_style),
@@ -816,39 +817,72 @@ async def make_pdf(update, pid):
     ]
     def P(t, st=None):
         return Paragraph(esc(t), st or small_style)
+    # Группируем по категориям
+    from collections import OrderedDict
+    groups = OrderedDict()
+    for r in rows:
+        groups.setdefault(r["category"], []).append(r)
     data = [[
-        Paragraph("Категория", small_bold),
         Paragraph("Наименование", small_bold),
         Paragraph("Кол-во", small_bold),
         Paragraph("Цена", small_bold),
         Paragraph("Сумма", small_bold),
         Paragraph("Чек", small_bold),
     ]]
-    for r in rows:
-        qv = Decimal(str(r["qty"]))
-        pv = Decimal(str(r["price"]))
-        s = qv * pv
-        receipt_mark = "📎" if r.get("receipt_file_id") else ""
+    cat_header_rows = []
+    subtotal_rows = []
+    for cat_name, items in groups.items():
+        cat_header_rows.append(len(data))
         data.append([
-            P(r["category"]),
-            P(r["name"]),
-            P(fmt_qty(qv)),
-            P(money(pv)),
-            P(money(s)),
-            P(receipt_mark),
+            Paragraph(f"<b>{esc(cat_name)}</b>", cat_style),
+            "", "", "", "",
         ])
+        cat_total = Decimal(0)
+        for r in items:
+            qv = Decimal(str(r["qty"]))
+            pv = Decimal(str(r["price"]))
+            s = qv * pv
+            cat_total += s
+            receipt_mark = "📎" if r.get("receipt_file_id") else ""
+            data.append([
+                P(r["name"]),
+                P(fmt_qty(qv)),
+                P(money(pv)),
+                P(money(s)),
+                P(receipt_mark),
+            ])
+        subtotal_rows.append(len(data))
+        data.append([
+            Paragraph("<b>Итого по категории:</b>", small_bold),
+            "",
+            "",
+            Paragraph(f"<b>{money(cat_total)}</b>", small_bold),
+            "",
+        ])
+    # Общий итог
     data.append([
-        "", "", "", "",
-        Paragraph("ИТОГО", small_bold),
-        Paragraph(money(total), small_bold),
+        Paragraph("<b>ВСЕГО:</b>", cat_style),
+        "",
+        "",
+        Paragraph(f"<b>{money(total)}</b>", cat_style),
+        "",
     ])
-    table = Table(data, repeatRows=1, colWidths=[85, 150, 45, 70, 80, 30])
-    table.setStyle(TableStyle([
+    table = Table(data, repeatRows=1, colWidths=[260, 55, 75, 85, 30])
+    style_cmds = [
         ("GRID", (0, 0), (-1, -1), .4, colors.grey),
         ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-        ("ALIGN", (2, 1), (-1, -1), "RIGHT"),
+        ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
+    ]
+    for idx in cat_header_rows:
+        style_cmds.append(("BACKGROUND", (0, idx), (-1, idx), colors.Color(0.94, 0.94, 0.94)))
+        style_cmds.append(("SPAN", (0, idx), (-1, idx)))
+    for idx in subtotal_rows:
+        style_cmds.append(("BACKGROUND", (0, idx), (-1, idx), colors.Color(0.97, 0.97, 0.92)))
+    # Общая итоговая строка
+    last = len(data) - 1
+    style_cmds.append(("BACKGROUND", (0, last), (-1, last), colors.Color(0.88, 0.88, 0.88)))
+    table.setStyle(TableStyle(style_cmds))
     story.append(table)
     doc.build(story)
     out.seek(0)
