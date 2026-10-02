@@ -732,7 +732,12 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await c.execute("UPDATE expenses SET receipt_file_id=$1, receipt_url=$2 WHERE id=$3", file_id, receipt_url, exp_id)
     ctx.user_data.pop("state", None); ctx.user_data.pop("receipt_exp_id", None); ctx.user_data.pop("receipt_pid", None)
     if receipt_url:
-        await update.message.reply_text(f"✅ Чек прикреплён!\n\nСсылка (открой в браузере):\n{receipt_url}", disable_web_page_preview=False)
+        await update.message.reply_text(
+            "✅ Чек прикреплён!",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🌐 Открыть чек в браузере", url=receipt_url)],
+            ]),
+        )
     else:
         await update.message.reply_text("⚠️ Не удалось загрузить в браузер. Проверь логи Railway.")
     return await send_project_msg(update.message, pid, edit=False, user_id=u.id)
@@ -1105,9 +1110,21 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not await user_can_view_project(exp["project_id"], u.id):
             return await q.edit_message_text("Нет доступа.")
         if exp["receipt_url"]:
-            await q.message.reply_text(f"📎 Чек: {esc(exp['name'])}\n\nСсылка (открой в браузере):\n{exp['receipt_url']}", parse_mode=ParseMode.HTML, disable_web_page_preview=False, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Открепить чек", callback_data=f"receipt:detach:{exp_id}")]]))
+            await q.message.reply_text(
+                f"📎 Чек: {esc(exp['name'])}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🌐 Открыть чек в браузере", url=exp["receipt_url"])],
+                    [InlineKeyboardButton("❌ Открепить чек", callback_data=f"receipt:detach:{exp_id}")],
+                ]),
+            )
         else:
-            await q.message.reply_text("⚠️ У этого чека нет ссылки. Переприкрепите его, чтобы открывать в браузере.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Открепить чек", callback_data=f"receipt:detach:{exp_id}")]]))
+            await q.message.reply_text(
+                "⚠️ У этого чека нет ссылки. Переприкрепите его.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Открепить чек", callback_data=f"receipt:detach:{exp_id}")],
+                ]),
+            )
         return
     if data.startswith("receipt:detach:"):
         exp_id = int(data.split(":")[2])
