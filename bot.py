@@ -836,7 +836,7 @@ async def make_pdf(update, pid):
         Paragraph(f"Осталось: {money(left)}", body_style),
         Spacer(1, 12),
     ]
-      small_style = ParagraphStyle("small", fontName=FONT, fontSize=8, leading=10)
+    small_style = ParagraphStyle("small", fontName=FONT, fontSize=8, leading=10)
     small_bold = ParagraphStyle("smallb", fontName=FONT_BOLD, fontSize=8, leading=10)
     def P(t):
         return Paragraph(esc(t), small_style)
