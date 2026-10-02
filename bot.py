@@ -836,15 +836,33 @@ async def make_pdf(update, pid):
         Paragraph(f"Осталось: {money(left)}", body_style),
         Spacer(1, 12),
     ]
-    data = [["Категория", "Наименование", "Кол-во", "Цена", "Сумма", "Чек"]]
+      small_style = ParagraphStyle("small", fontName=FONT, fontSize=8, leading=10)
+    small_bold = ParagraphStyle("smallb", fontName=FONT_BOLD, fontSize=8, leading=10)
+    def P(t):
+        return Paragraph(esc(t), small_style)
+    data = [[
+        Paragraph("Категория", small_bold),
+        Paragraph("Наименование", small_bold),
+        Paragraph("Кол-во", small_bold),
+        Paragraph("Цена", small_bold),
+        Paragraph("Сумма", small_bold),
+        Paragraph("Чек", small_bold),
+    ]]
     for r in rows:
         qv = Decimal(str(r["qty"]))
         pv = Decimal(str(r["price"]))
         s = qv * pv
         receipt_mark = "📎" if r.get("receipt_file_id") else ""
-        data.append([r["category"], r["name"], fmt_qty(qv), money(pv), money(s), receipt_mark])
-    data.append(["", "", "", "ИТОГО", money(total), ""])
-    table = Table(data, repeatRows=1, colWidths=[90, 160, 50, 70, 80, 30])
+        data.append([
+            P(r["category"]),
+            P(r["name"]),
+            P(fmt_qty(qv)),
+            P(money(pv)),
+            P(money(s)),
+            P(receipt_mark),
+        ])
+    data.append(["", "", "", "", Paragraph("ИТОГО", small_bold), Paragraph(money(total), small_bold)])
+    table = Table(data, repeatRows=1, colWidths=[85, 150, 45, 70, 80, 40])
     table.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), .4, colors.grey),
         ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
@@ -1583,10 +1601,22 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = f"📋 <b>Расходы проекта «{esc(p['name'])}»</b>\n\n{body}"
         if len(text) > 4000:
             text = text[:3900] + "\n\n… (показаны не все)"
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Добавить расход", callback_data=f"exp:add:{pid}")],
-            [InlineKeyboardButton("◀️ Назад к проекту", callback_data=f"project:view:{pid}")],
-        ])
+                kb_rows = []
+        async with pool.acquire() as c:
+            check_rows = await c.fetch(
+                "SELECT id, name FROM expenses WHERE project_id=$1 AND receipt_file_id IS NOT NULL ORDER BY id DESC LIMIT 5",
+                pid,
+            )
+        for r in check_rows:
+            kb_rows.append([
+                InlineKeyboardButton(
+                    f"📎 Чек: {r['name'][:25]}",
+                    callback_data=f"receipt:show:{r['id']}"
+                )
+            ])
+        kb_rows.append([InlineKeyboardButton("➕ Добавить расход", callback_data=f"exp:add:{pid}")])
+        kb_rows.append([InlineKeyboardButton("◀️ Назад к проекту", callback_data=f"project:view:{pid}")])
+        kb = InlineKeyboardMarkup(kb_rows)
         return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
     if data.startswith("cat:"):
@@ -1709,7 +1739,26 @@ async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Отправьте <b>фото</b> (не файл).\n\n/cancel — отмена.",
             parse_mode=ParseMode.HTML,
         )
-
+    if data.startswith("receipt:show:"):
+        exp_id = int(data.split(":")[2])
+        async with pool.acquire() as c:
+            exp = await c.fetchrow(
+                "SELECT id, project_id, name, receipt_file_id FROM expenses WHERE id=$1",
+                exp_id,
+            )
+        if not exp or not exp["receipt_file_id"]:
+            return await q.edit_message_text("Чек не найден.")
+        if not await user_can_view_project(exp["project_id"], u.id):
+            return await q.edit_message_text("Нет доступа.")
+        try:
+            await q.message.reply_photo(
+                exp["receipt_file_id"],
+                caption=f"📎 Чек: {esc(exp['name'])}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            log.error("Send receipt failed: %s", e)
+            await q.message.reply_text("Не удалось загрузить фото.")
     if data.startswith("edit_exp:choose:"):
         pid = int(data.split(":")[2])
         if not await user_can_view_project(pid, u.id):
